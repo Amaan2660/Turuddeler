@@ -40,12 +40,15 @@ AIRPORT_KW = {"cph", "cph airport", "copenhagen airport", "kastrup", "københavn
 DEFAULT_DRIVER_COOLDOWN = timedelta(minutes=75)   # gap between a driver's rides
 DEFAULT_CAR_HANDOVER = timedelta(minutes=75)      # buffer before a car can switch drivers
 
+SOFT_EARLY_MIN = 30   # "often" earlier
+HARD_EARLY_MIN = 60   # "ONLY IF ABSOLUTELY Necessary" earlier (flag it)
+LATE_ALLOW_MIN = 20   # can run this much later
+
 # =========================
 # Data access
 # =========================
 def load_drivers():
     with engine.connect() as conn:
-        # alias driver_id -> id so the rest of the code keeps working
         df = pd.read_sql(
             "SELECT driver_id AS id, name, number FROM drivers ORDER BY name",
             conn
@@ -53,7 +56,7 @@ def load_drivers():
     return df
 
 # =========================
-# Helpers for busy time
+# Helpers
 # =========================
 def is_airport_pickup(pickup_text: str) -> bool:
     s = (pickup_text or "").strip().lower()
@@ -66,6 +69,46 @@ def parse_minutes(value):
         return int(float(value))
     except:
         return None
+
+def parse_time(hhmm: str):
+    if not hhmm: return None
+    hhmm = str(hhmm).strip()
+    for fmt in ("%H:%M", "%H.%M", "%H%M"):
+        try:
+            return datetime.strptime(hhmm, fmt).time()
+        except:
+            pass
+    return None
+
+def combine(service_date: datetime.date, t: datetime.time) -> datetime:
+    return datetime.combine(service_date, t)
+
+def in_flex_window(pickup_dt: datetime, start_dt: datetime, end_dt: datetime,
+                   soft_early: int, hard_early: int, late_allow: int):
+    """
+    Return ("soft"|"hard"|None) if pickup fits within shift with the allowed flex.
+    We allow:
+      - start up to soft_early earlier ("soft")
+      - if not possible, start up to hard_early earlier ("hard")
+      - end up to late_allow later
+    Overnight shifts supported if end_dt <= start_dt (roll +1 day).
+    """
+    if end_dt <= start_dt:
+        end_dt = end_dt + timedelta(days=1)
+
+    # soft window
+    soft_start = start_dt - timedelta(minutes=soft_early)
+    soft_end   = end_dt + timedelta(minutes=late_allow)
+    if soft_start <= pickup_dt <= soft_end:
+        return "soft"
+
+    # hard window
+    hard_start = start_dt - timedelta(minutes=hard_early)
+    hard_end   = end_dt + timedelta(minutes=late_allow)
+    if hard_start <= pickup_dt <= hard_end:
+        return "hard"
+
+    return None
 
 def busy_block_for_row(row: pd.Series) -> timedelta:
     """
@@ -113,24 +156,26 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
     return timedelta(minutes=trip_min)
 
 # =========================
-# Assignment logic
+# Assignment logic (with per-driver prefs and shifts)
 # =========================
-def assign_plan(
+def assign_plan_with_prefs(
     rides_df: pd.DataFrame,
-    driver_names: list,
+    driver_rows: pd.DataFrame,
     active_cars: list,
+    service_date: datetime.date,
     driver_cooldown: timedelta,
-    car_handover: timedelta
+    car_handover: timedelta,
+    soft_early: int,
+    hard_early: int,
+    late_allow: int
 ) -> pd.DataFrame:
     """
-    Assign rides with constraints:
-      - Driver cooldown after each assigned ride
-      - Car handover buffer before car can be used by next driver
-      - Busy block per ride per rules above
+    driver_rows columns expected: name, start, end, preferred_car (can be "")
+    - Honors per-driver start/end with soft/hard flex + late allow
+    - If preferred_car given, tries that car first (optional)
+    - Enforces car handover + driver cooldown + busy time logic
+    - Marks "Hard Early Start" in Notes if that path was required
     """
-    if not driver_names:
-        return rides_df.assign(**{"Assigned Driver":"", "Car":"", "Notes":"No drivers selected"})
-
     rides = rides_df.copy()
 
     # Require 'Pickup Time'
@@ -140,7 +185,7 @@ def assign_plan(
     if rides["Pickup Time"].isna().any():
         raise ValueError("Some 'Pickup Time' values are invalid. Use a parseable format like 'YYYY-MM-DD HH:MM' or 'HH:MM' (with a separate Date column).")
 
-    # Optional 'Date' column to anchor HH:MM to a day
+    # Optional 'Date'
     if "Date" in rides.columns and rides["Date"].notna().any():
         base_date = pd.to_datetime(rides["Date"], errors="coerce").dt.date
         rides["Pickup Time"] = pd.to_datetime(base_date.astype(str) + " " + rides["Pickup Time"].dt.strftime("%H:%M"))
@@ -152,57 +197,96 @@ def assign_plan(
     rides["Car"] = ""
     rides["Notes"] = ""
 
-    # State trackers
-    driver_next_free = {name: datetime.min for name in driver_names}
+    # Build driver state
+    states = {}
+    for _, r in driver_rows.iterrows():
+        name = r["name"]
+        stt = parse_time(r.get("start",""))
+        endt = parse_time(r.get("end",""))
+        if stt is None or endt is None:
+            # if not provided, treat as all-day
+            stt = parse_time("00:00")
+            endt = parse_time("23:59")
+        states[name] = {
+            "start_dt": combine(service_date, stt),
+            "end_dt":   combine(service_date, endt),
+            "preferred_car": (r.get("preferred_car") or "").strip(),
+            "next_free": datetime.min
+        }
+
+    # Car state
     car_next_free = {car: datetime.min for car in active_cars}
 
-    # Round-robins
-    driver_idx = 0
-    car_idx = 0
+    # Helper to pick a car for a driver
+    rr_idx = 0  # round robin among cars when no preference
+    def pick_car(for_driver: str, pickup_dt: datetime):
+        pref = states[for_driver]["preferred_car"]
+        # try preferred first if set and is active
+        if pref and pref in active_cars:
+            if pickup_dt >= car_next_free[pref]:
+                return pref
+        # otherwise round-robin any car that is free
+        nonlocal rr_idx
+        for _ in range(len(active_cars)):
+            car = active_cars[rr_idx]
+            rr_idx = (rr_idx + 1) % len(active_cars)
+            if pickup_dt >= car_next_free[car]:
+                return car
+        return None
+
+    # Driver list for round-robin when multiple are feasible
+    driver_names = list(states.keys())
+    d_rr = 0
 
     for i, row in rides.iterrows():
         pickup_dt = row["Pickup Time"]
         busy_td = busy_block_for_row(row)
 
-        # Find free driver
-        assigned_driver = None
+        # find feasible drivers by shift window + next_free
+        feasible = []
+        hard_needed = {}
         for _ in range(len(driver_names)):
-            name = driver_names[driver_idx]
-            if pickup_dt >= driver_next_free[name]:
-                assigned_driver = name
-                driver_idx = (driver_idx + 1) % len(driver_names)
-                break
-            driver_idx = (driver_idx + 1) % len(driver_names)
+            name = driver_names[d_rr]
+            d_rr = (d_rr + 1) % len(driver_names)
 
-        if assigned_driver is None:
-            rides.at[i, "Notes"] = "No driver free"
+            st_dt = states[name]["start_dt"]
+            en_dt = states[name]["end_dt"]
+            flex = in_flex_window(pickup_dt, st_dt, en_dt, SOFT_EARLY_MIN, HARD_EARLY_MIN, LATE_ALLOW_MIN)
+            if flex is None:
+                continue
+            if pickup_dt < states[name]["next_free"]:
+                continue
+            feasible.append(name)
+            hard_needed[name] = (flex == "hard")
+
+        if not feasible:
+            rides.at[i, "Notes"] = "No driver free (window)"
             continue
 
-        # Find free car
-        assigned_car = None
-        for _ in range(len(active_cars)):
-            car = active_cars[car_idx]
-            if pickup_dt >= car_next_free[car]:
-                assigned_car = car
-                car_idx = (car_idx + 1) % len(active_cars)
-                break
-            car_idx = (car_idx + 1) % len(active_cars)
+        # greedily pick first feasible driver (already RR order)
+        chosen = feasible[0]
+        chosen_hard = hard_needed[chosen]
 
-        if assigned_car is None:
+        # find a car for this driver
+        car = pick_car(chosen, pickup_dt)
+        if car is None:
             rides.at[i, "Notes"] = "No car free"
-            # (we keep the driver assignment attempt order; next ride tries the next car)
+            # do not advance driver's next_free; try again on later rides
             continue
 
-        # Assign + update states
-        next_free_driver = pickup_dt + driver_cooldown + busy_td
-        next_free_car = pickup_dt + busy_td + car_handover
+        # assign
+        next_free_driver = pickup_dt + DEFAULT_DRIVER_COOLDOWN + busy_td
+        next_free_car = pickup_dt + busy_td + DEFAULT_CAR_HANDOVER
 
-        rides.at[i, "Assigned Driver"] = assigned_driver
-        rides.at[i, "Car"] = assigned_car
-        rides.at[i, "Notes"] = f"Busy until {next_free_driver.strftime('%H:%M')}"
+        rides.at[i, "Assigned Driver"] = chosen
+        rides.at[i, "Car"] = car
+        note = f"Busy until {next_free_driver.strftime('%H:%M')}"
+        if chosen_hard:
+            note += " · Hard Early Start"
+        rides.at[i, "Notes"] = note
 
-        driver_next_free[assigned_driver] = next_free_driver
-        car_next_free[assigned_car] = next_free_car
+        states[chosen]["next_free"] = next_free_driver
+        car_next_free[car] = next_free_car
 
     return rides
 
@@ -227,41 +311,71 @@ if rides_file:
         st.error(f"Failed to read CSV: {e}")
         st.stop()
 
+    # Choose service date for shifts (defaults to today)
+    service_date = st.date_input("Service date", value=datetime.now().date())
+
     # Choose active cars
     default_active = [c for c in CAR_POOL if c.lower() != "s-klasse"]
-    active_cars = st.multiselect("Select active cars", CAR_POOL, default=default_active)
+    active_cars = st.multiselect("Active cars (only these can be used)", CAR_POOL, default=default_active)
     if not active_cars:
         st.warning("Activate at least one car.")
         st.stop()
 
-    # Choose active drivers (cap by active cars)
-    all_driver_names = drivers_df["name"].tolist()
-    default_drivers = all_driver_names[: min(len(all_driver_names), len(active_cars))]
-    selected_drivers = st.multiselect(
-        f"Select drivers for today (max {len(active_cars)} at a time)",
-        all_driver_names,
-        default=default_drivers
+    # Choose drivers for today + per-driver options
+    st.subheader("Drivers for today")
+    all_names = drivers_df["name"].tolist()
+    default_names = all_names[: min(len(all_names), len(active_cars))]
+    selected_names = st.multiselect(
+        f"Select drivers (capacity limited by cars: {len(active_cars)})",
+        all_names,
+        default=default_names
     )
-    if len(selected_drivers) > len(active_cars):
-        st.warning(f"You selected {len(selected_drivers)} drivers but only {len(active_cars)} active cars — only the first {len(active_cars)} will be used.")
-        selected_drivers = selected_drivers[: len(active_cars)]
+    if len(selected_names) > len(active_cars):
+        st.warning(f"You selected {len(selected_names)} drivers but only {len(active_cars)} active cars — only the first {len(active_cars)} will be used.")
+        selected_names = selected_names[: len(active_cars)]
 
-    # Advanced timing knobs (no globals)
+    st.caption("Optional: set per-driver start/end and preferred car. Leave blank to let the allocator decide.")
+    rows = []
+    cols = st.columns(3)
+    for i, name in enumerate(selected_names):
+        with cols[i % 3]:
+            st.markdown(f"**{name}**")
+            start = st.text_input(f"{name} start (HH:MM)", key=f"start_{name}", placeholder="08:00")
+            end   = st.text_input(f"{name} end (HH:MM)", key=f"end_{name}", placeholder="16:00")
+            pref  = st.selectbox(f"{name} preferred car (optional)", [""] + active_cars, index=0, key=f"car_{name}")
+            rows.append({"name": name, "start": start, "end": end, "preferred_car": pref})
+
+    driver_rows = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["name","start","end","preferred_car"])
+
+    # Advanced timing knobs (you can tweak; defaults match what you asked)
     with st.expander("Advanced timing (optional)"):
-        dc_min = st.number_input("Driver cooldown minutes (default 75)", 0, 240, 75, 5)
-        hb_min = st.number_input("Car handover buffer minutes (default 75)", 0, 240, 75, 5)
-        driver_cooldown = timedelta(minutes=int(dc_min))
-        car_handover = timedelta(minutes=int(hb_min))
+        dc_min = st.number_input("Driver cooldown minutes", 0, 240, 75, 5)
+        hb_min = st.number_input("Car handover buffer minutes", 0, 240, 75, 5)
+        soft_min = st.number_input("Soft early start (min)", 0, 180, 30, 5)
+        hard_min = st.number_input("Hard early start (min)", 0, 240, 60, 5)
+        late_min = st.number_input("Late end allowed (min)", 0, 120, 20, 5)
+
+        # override globals used by assignment helpers
+        global DEFAULT_DRIVER_COOLDOWN, DEFAULT_CAR_HANDOVER, SOFT_EARLY_MIN, HARD_EARLY_MIN, LATE_ALLOW_MIN
+        DEFAULT_DRIVER_COOLDOWN = timedelta(minutes=int(dc_min))
+        DEFAULT_CAR_HANDOVER = timedelta(minutes=int(hb_min))
+        SOFT_EARLY_MIN = int(soft_min)
+        HARD_EARLY_MIN = int(hard_min)
+        LATE_ALLOW_MIN = int(late_min)
 
     # Generate plan
     if st.button("Generate Plan"):
         try:
-            plan_df = assign_plan(
-                rides_df,
-                selected_drivers,
-                active_cars,
-                driver_cooldown if 'driver_cooldown' in locals() else DEFAULT_DRIVER_COOLDOWN,
-                car_handover if 'car_handover' in locals() else DEFAULT_CAR_HANDOVER
+            plan_df = assign_plan_with_prefs(
+                rides_df=rides_df,
+                driver_rows=driver_rows,
+                active_cars=active_cars,
+                service_date=service_date,
+                driver_cooldown=DEFAULT_DRIVER_COOLDOWN,
+                car_handover=DEFAULT_CAR_HANDOVER,
+                soft_early=SOFT_EARLY_MIN,
+                hard_early=HARD_EARLY_MIN,
+                late_allow=LATE_ALLOW_MIN
             )
         except Exception as e:
             st.error(f"Planning failed: {e}")
