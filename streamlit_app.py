@@ -1,7 +1,7 @@
 import os
 import streamlit as st
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from datetime import datetime, timedelta
 
 # =========================
@@ -19,7 +19,7 @@ if not db_url:
     st.warning("No DATABASE_URL found in secrets or env; using local SQLite (app.db).")
     db_url = "sqlite:///app.db"
 
-# add psycopg2 and SSL for Supabase if missing
+# Add psycopg2 driver + SSL for Supabase pooler automatically
 if db_url.startswith("postgresql://") and "psycopg2" not in db_url:
     db_url = db_url.replace("postgresql://", "postgresql+psycopg2://")
 if db_url.startswith("postgresql") and "sslmode=" not in db_url:
@@ -37,13 +37,14 @@ CAR_POOL = [
 ]
 AIRPORT_KW = {"cph", "cph airport", "copenhagen airport", "kastrup", "københavn lufthavn", "kastrup lufthavn"}
 
-DRIVER_COOLDOWN = timedelta(hours=1, minutes=15)  # min gap between a driver’s rides
-CAR_HANDOVER_BUFFER = timedelta(minutes=75)       # charge/wash before next driver takes same car
+DEFAULT_DRIVER_COOLDOWN = timedelta(minutes=75)   # gap between a driver's rides
+DEFAULT_CAR_HANDOVER = timedelta(minutes=75)      # buffer before a car can switch drivers
 
 # =========================
 # Data access
 # =========================
-def load_drivers():
+def load_drivers() -> pd.DataFrame:
+    """Expect a 'drivers' table with at least columns: id, name"""
     try:
         with engine.connect() as conn:
             df = pd.read_sql("SELECT id, name FROM drivers ORDER BY name", conn)
@@ -71,16 +72,16 @@ def parse_minutes(value):
 
 def busy_block_for_row(row: pd.Series) -> timedelta:
     """
-    Compute extra busy block (in addition to the ride itself) based on rules:
-      - Far-away: Distance_km > 45 => block = trip_minutes + (30m if pickup is airport)
-      - Roadshow / Site Inspection: use Duration (Hours/Minutes) if provided; else trip + 60m
-    If no trip_minutes known, treat trip ~30m.
-    Columns used if present:
-      Distance_km, Pickup, Customer Name, Type, Duration Minutes, Duration Hours, Trip Minutes
+    Extra busy time based on rules:
+      - Roadshow / Site Inspection: use Duration (Minutes/Hours) if present; else Trip + 60.
+      - Far-away: Distance_km > 45 => Trip + 30 if pickup is airport else Trip.
+      - Else: Trip (or 30 if not provided).
+    Uses optional CSV columns:
+      Trip Minutes, Distance_km, Pickup, Customer Name, Type, Duration Minutes, Duration Hours
     """
     trip_min = parse_minutes(row.get("Trip Minutes"))
     if trip_min is None:
-        trip_min = 30  # fallback
+        trip_min = 30  # fallback trip estimate
 
     distance_km = None
     try:
@@ -92,56 +93,61 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
     pickup_txt = str(row.get("Pickup", "") or "")
     cust_txt = (str(row.get("Customer Name", "") or "") + " " + str(row.get("Type", "") or "")).lower()
 
-    # Roadshow / Site Inspection — highest priority
+    # Roadshow / Site Inspection first
     if "roadshow" in cust_txt or "site inspection" in cust_txt:
         dur_min = parse_minutes(row.get("Duration Minutes"))
         if dur_min is None:
-            # allow duration in hours too
             dur_hours = row.get("Duration Hours")
             try:
                 if dur_hours not in (None, ""):
                     dur_min = int(float(dur_hours) * 60)
             except:
-                pass
+                dur_min = None
         if dur_min and dur_min > 0:
-            return timedelta(minutes=dur_min)  # block for full stated duration
-        return timedelta(minutes=trip_min + 60)  # fallback: trip + 60 on-site
+            return timedelta(minutes=dur_min)
+        return timedelta(minutes=trip_min + 60)
 
-    # Far-away distance rule
+    # Far-away rule
     if distance_km is not None and distance_km > 45:
         extra = 30 if is_airport_pickup(pickup_txt) else 0
         return timedelta(minutes=trip_min + extra)
 
-    # Default: just the trip time
+    # Default = trip time
     return timedelta(minutes=trip_min)
 
 # =========================
 # Assignment logic
 # =========================
-def assign_plan(rides_df: pd.DataFrame, driver_names: list[str], active_cars: list[str]) -> pd.DataFrame:
+def assign_plan(
+    rides_df: pd.DataFrame,
+    driver_names: list,
+    active_cars: list,
+    driver_cooldown: timedelta,
+    car_handover: timedelta
+) -> pd.DataFrame:
     """
-    Assign rides to drivers and cars with constraints:
-      - Driver cooldown >= 1h15m after each ride
-      - Car handover buffer 75m before next driver uses same car
-      - Busy block per ride from far-away/roadshow/site inspection rules
-    Notes include 'Busy until HH:MM'.
+    Assign rides with constraints:
+      - Driver cooldown after each assigned ride
+      - Car handover buffer before car can be used by next driver
+      - Busy block per ride per rules above
     """
     if not driver_names:
         return rides_df.assign(**{"Assigned Driver":"", "Car":"", "Notes":"No drivers selected"})
 
-    # Parse/normalize times
     rides = rides_df.copy()
+
+    # Require 'Pickup Time'
     if "Pickup Time" not in rides.columns:
         raise ValueError("CSV must include 'Pickup Time' column.")
     rides["Pickup Time"] = pd.to_datetime(rides["Pickup Time"], errors="coerce")
     if rides["Pickup Time"].isna().any():
         raise ValueError("Some 'Pickup Time' values are invalid. Use a parseable format like 'YYYY-MM-DD HH:MM' or 'HH:MM' (with a separate Date column).")
-    # Optional Date column to anchor time-of-day to a specific date
-    if "Date" in rides.columns:
+
+    # Optional 'Date' column to anchor HH:MM to a day
+    if "Date" in rides.columns and rides["Date"].notna().any():
         base_date = pd.to_datetime(rides["Date"], errors="coerce").dt.date
         rides["Pickup Time"] = pd.to_datetime(base_date.astype(str) + " " + rides["Pickup Time"].dt.strftime("%H:%M"))
 
-    # Sort by pickup
     rides = rides.sort_values("Pickup Time").reset_index(drop=True)
 
     # Prepare outputs
@@ -150,9 +156,8 @@ def assign_plan(rides_df: pd.DataFrame, driver_names: list[str], active_cars: li
     rides["Notes"] = ""
 
     # State trackers
-    driver_next_free = {name: datetime.min for name in driver_names}   # when each driver can take the next job
-    car_next_free = {car: datetime.min for car in active_cars}         # when each car is free for next (after handover buffer)
-    # Optional: remember last driver who used a car (cosmetic, not required here)
+    driver_next_free = {name: datetime.min for name in driver_names}
+    car_next_free = {car: datetime.min for car in active_cars}
 
     # Round-robins
     driver_idx = 0
@@ -160,11 +165,9 @@ def assign_plan(rides_df: pd.DataFrame, driver_names: list[str], active_cars: li
 
     for i, row in rides.iterrows():
         pickup_dt = row["Pickup Time"]
-
-        # Compute busy block for this ride
         busy_td = busy_block_for_row(row)
 
-        # Find a driver who is free by pickup_dt
+        # Find free driver
         assigned_driver = None
         for _ in range(len(driver_names)):
             name = driver_names[driver_idx]
@@ -175,11 +178,10 @@ def assign_plan(rides_df: pd.DataFrame, driver_names: list[str], active_cars: li
             driver_idx = (driver_idx + 1) % len(driver_names)
 
         if assigned_driver is None:
-            # No driver free — leave unassigned with reason
             rides.at[i, "Notes"] = "No driver free"
             continue
 
-        # Find a car free by pickup_dt
+        # Find free car
         assigned_car = None
         for _ in range(len(active_cars)):
             car = active_cars[car_idx]
@@ -191,18 +193,17 @@ def assign_plan(rides_df: pd.DataFrame, driver_names: list[str], active_cars: li
 
         if assigned_car is None:
             rides.at[i, "Notes"] = "No car free"
-            # roll back the driver_idx advance so next ride can try the same driver order again
+            # (we keep the driver assignment attempt order; next ride tries the next car)
             continue
 
-        # All good — assign
-        next_free_driver = pickup_dt + DRIVER_COOLDOWN + busy_td
-        next_free_car = pickup_dt + busy_td + CAR_HANDOVER_BUFFER
+        # Assign + update states
+        next_free_driver = pickup_dt + driver_cooldown + busy_td
+        next_free_car = pickup_dt + busy_td + car_handover
 
         rides.at[i, "Assigned Driver"] = assigned_driver
         rides.at[i, "Car"] = assigned_car
         rides.at[i, "Notes"] = f"Busy until {next_free_driver.strftime('%H:%M')}"
 
-        # Update states
         driver_next_free[assigned_driver] = next_free_driver
         car_next_free[assigned_car] = next_free_car
 
@@ -236,7 +237,7 @@ if rides_file:
         st.warning("Activate at least one car.")
         st.stop()
 
-    # Choose active drivers (limit by number of cars)
+    # Choose active drivers (cap by active cars)
     all_driver_names = drivers_df["name"].tolist()
     default_drivers = all_driver_names[: min(len(all_driver_names), len(active_cars))]
     selected_drivers = st.multiselect(
@@ -244,24 +245,27 @@ if rides_file:
         all_driver_names,
         default=default_drivers
     )
-
-    # Enforce capacity: only as many drivers as cars
     if len(selected_drivers) > len(active_cars):
         st.warning(f"You selected {len(selected_drivers)} drivers but only {len(active_cars)} active cars — only the first {len(active_cars)} will be used.")
         selected_drivers = selected_drivers[: len(active_cars)]
 
-    # Optional knobs
+    # Advanced timing knobs (no globals)
     with st.expander("Advanced timing (optional)"):
-        global DRIVER_COOLDOWN, CAR_HANDOVER_BUFFER
         dc_min = st.number_input("Driver cooldown minutes (default 75)", 0, 240, 75, 5)
         hb_min = st.number_input("Car handover buffer minutes (default 75)", 0, 240, 75, 5)
-        DRIVER_COOLDOWN = timedelta(minutes=int(dc_min))
-        CAR_HANDOVER_BUFFER = timedelta(minutes=int(hb_min))
+        driver_cooldown = timedelta(minutes=int(dc_min))
+        car_handover = timedelta(minutes=int(hb_min))
 
     # Generate plan
     if st.button("Generate Plan"):
         try:
-            plan_df = assign_plan(rides_df, selected_drivers, active_cars)
+            plan_df = assign_plan(
+                rides_df,
+                selected_drivers,
+                active_cars,
+                driver_cooldown if 'driver_cooldown' in locals() else DEFAULT_DRIVER_COOLDOWN,
+                car_handover if 'car_handover' in locals() else DEFAULT_CAR_HANDOVER
+            )
         except Exception as e:
             st.error(f"Planning failed: {e}")
             st.stop()
