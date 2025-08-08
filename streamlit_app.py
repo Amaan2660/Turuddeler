@@ -43,17 +43,14 @@ DEFAULT_CAR_HANDOVER = timedelta(minutes=75)      # buffer before a car can swit
 # =========================
 # Data access
 # =========================
-def load_drivers() -> pd.DataFrame:
-    """Expect a 'drivers' table with at least columns: id, name"""
-    try:
-        with engine.connect() as conn:
-            df = pd.read_sql("SELECT id, name FROM drivers ORDER BY name", conn)
-        if "name" not in df.columns:
-            st.error("The 'drivers' table must have a 'name' column.")
-        return df
-    except Exception as e:
-        st.error(f"DB read failed. Check DATABASE_URL. Details: {e}")
-        return pd.DataFrame(columns=["id","name"])
+def load_drivers():
+    with engine.connect() as conn:
+        # alias driver_id -> id so the rest of the code keeps working
+        df = pd.read_sql(
+            "SELECT driver_id AS id, name, number FROM drivers ORDER BY name",
+            conn
+        )
+    return df
 
 # =========================
 # Helpers for busy time
