@@ -39,7 +39,6 @@ CAR_POOL = [
 AIRPORT_KW = {"cph", "cph airport", "copenhagen airport", "kastrup", "københavn lufthavn", "kastrup lufthavn"}
 CPH_KW = {"copenhagen", "københavn", "cph", "kastrup", "frederiksberg"}
 
-# Far-away settings (force to 209)
 FAR_DISTANCE_KM = 45.0
 FAR_CAR_ID = "209"
 
@@ -94,7 +93,7 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
     """
     Busy time for the ride (duration driver is occupied from pickup):
       - Roadshow / Site Inspection: Duration Minutes/Hours if given; else Trip + 60.
-      - Far-away: Distance_km > FAR_DISTANCE_KM => Trip + (30 if pickup is airport else 0).
+      - Far-away: Distance_km >= FAR_DISTANCE_KM => Trip + (30 if pickup is airport else 0).
       - Else: Trip (or 30 fallback).
     CSV columns used if present:
       Trip Minutes, Distance_km, Pickup, Customer Name, Type, Duration Minutes, Duration Hours
@@ -202,14 +201,16 @@ def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: tim
         req_start = r.get("start")
         req_end = r.get("end")
         if req_start is None or req_end is None:
-            req_start = datetime.combine(date.today(), datetime.strptime("00:00","%H:%M").time())
-            req_end   = datetime.combine(date.today(), datetime.strptime("23:59","%H:%M").time())
+            # treat as all-day if missing (anchor to today purely for ordering; allocator uses real service_date later)
+            today = date.today()
+            req_start = datetime.combine(today, datetime.strptime("00:00","%H:%M").time())
+            req_end   = datetime.combine(today, datetime.strptime("23:59","%H:%M").time())
         if req_end <= req_start:
             req_end = req_end + timedelta(days=1)
 
         pref = (r.get("preferred_car") or "").strip()
 
-        # Candidate order: preferred first (if any), otherwise choose earliest-free car
+        # Candidate order: preferred first (if any), otherwise earliest-free car
         if pref and pref in active_cars:
             candidates = [pref] + [c for c in active_cars if c != pref]
         else:
@@ -219,7 +220,7 @@ def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: tim
         best_car = None
         best_earliest_start = None
         for car in candidates:
-            earliest_start = max(req_start, car_free_at[car] + handover)  # must respect handover before next shift
+            earliest_start = max(req_start, car_free_at[car] + handover)  # must respect handover before next driver
             if best_car is None or earliest_start < best_earliest_start:
                 best_car = car
                 best_earliest_start = earliest_start
@@ -284,7 +285,7 @@ def assign_plan_with_rostered_cars(
     late_allow: int,
     auto_relax_to_soft: bool,
     respect_dates: bool
-) -> pd.DataFrame:
+):
     """
     - Build a car roster (one car per driver for whole shift; shifts may be pushed by car availability + handover)
     - Assign rides respecting:
@@ -332,9 +333,10 @@ def assign_plan_with_rostered_cars(
     states = {}
     for _, r in driver_rows.iterrows():
         name = r["name"]
+        # chosen car from roster (or the optional preferred)
         car = roster.get(name, (r.get("preferred_car") or "").strip())
         if not car:
-            # Shouldn't happen, but guard
+            # no car could be assigned (shouldn't happen if active_cars not empty)
             continue
         eff_start, eff_end = effective_windows[name]
         if eff_end <= eff_start:
@@ -346,7 +348,7 @@ def assign_plan_with_rostered_cars(
             "last_row": None,
         }
 
-    # Quick hint if far-away rides exist but FAR_CAR_ID isn't active
+    # Hint if far-away rides exist but FAR_CAR_ID isn't active
     has_far = any(is_far_away_row(r) for _, r in rides.iterrows())
     if has_far and FAR_CAR_ID not in active_cars:
         st.warning(f"Far-away bookings detected but car {FAR_CAR_ID} is not active. Those jobs will not be assigned.")
@@ -366,6 +368,7 @@ def assign_plan_with_rostered_cars(
             d_rr = (d_rr + 1) % len(driver_names)
 
             car = states[name]["car"]
+
             # Enforce far-away->FAR_CAR_ID
             if far_req:
                 if car != FAR_CAR_ID:
@@ -421,7 +424,6 @@ def assign_plan_with_rostered_cars(
         if chosen_hard:
             note += " · Hard Early Start"
         if far_req and chosen_car != FAR_CAR_ID:
-            # Safety (shouldn't happen due to filters)
             note += f" · WARNING: far-away not on {FAR_CAR_ID}"
         rides.at[i, "Assigned Driver"] = chosen
         rides.at[i, "Car"] = chosen_car
@@ -481,12 +483,16 @@ if rides_file:
 
     # Active cars
     default_active = [c for c in CAR_POOL if c.lower() != "s-klasse"]
-    active_cars_live = st.multiselect("Active cars (one driver per car at a time; handovers allowed)", CAR_POOL, default=default_active)
+    active_cars_live = st.multiselect(
+        "Active cars (one driver per car at a time; handovers allowed)",
+        CAR_POOL,
+        default=default_active
+    )
     if not active_cars_live:
         st.warning("Activate at least one car.")
         st.stop()
 
-    # Drivers for today + per-driver options
+    # Drivers for today + per-driver options (with per-driver dates)
     st.subheader("Drivers for today")
     all_names = drivers_df["name"].tolist()
     selected_names_live = st.multiselect(
@@ -501,11 +507,15 @@ if rides_file:
     for i, name in enumerate(selected_names_live):
         with cols[i % 2]:
             st.markdown(f"**{name}**")
-            start_t = st.time_input(f"{name} start", value=None, key=f"start_{name}")
-            end_t   = st.time_input(f"{name} end", value=None, key=f"end_{name}")
-            pref    = st.selectbox(f"{name} preferred car (optional)", [""] + active_cars_live, index=0, key=f"car_{name}")
-            start_dt = datetime.combine(service_date, start_t) if start_t else None
-            end_dt   = datetime.combine(service_date, end_t) if end_t else None
+            # Per-driver dates default to service_date but can be changed
+            start_date = st.date_input(f"{name} start date", value=service_date, key=f"sd_{name}")
+            start_time = st.time_input(f"{name} start time", value=None, key=f"st_{name}")
+            end_date   = st.date_input(f"{name} end date", value=service_date, key=f"ed_{name}")
+            end_time   = st.time_input(f"{name} end time", value=None, key=f"et_{name}")
+            pref       = st.selectbox(f"{name} preferred car (optional)", [""] + active_cars_live, index=0, key=f"car_{name}")
+
+            start_dt = datetime.combine(start_date, start_time) if start_time else None
+            end_dt   = datetime.combine(end_date, end_time) if end_time else None
             rows.append({"name": name, "start": start_dt, "end": end_dt, "preferred_car": pref})
     driver_rows_live = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["name","start","end","preferred_car"])
 
@@ -517,8 +527,8 @@ if rides_file:
         late_min = st.slider("Late end allowed (min)", 0, 120, 20, 5)
         auto_relax = st.checkbox("If a job is unassigned for window only, auto-relax to SOFT", value=True)
 
-    c1, c2 = st.columns([1,1])
-    with c1:
+    col_run, col_clear = st.columns(2)
+    with col_run:
         if st.button("Generate"):
             st.session_state.snapshot = {
                 "rides_df": rides_df_live.copy(),
@@ -533,7 +543,7 @@ if rides_file:
                 "auto_relax": bool(auto_relax),
             }
             st.session_state.run_plan = True
-    with c2:
+    with col_clear:
         if st.button("Clear"):
             st.session_state.run_plan = False
             st.session_state.snapshot = {}
@@ -542,4 +552,62 @@ if rides_file:
         s = st.session_state.snapshot
         try:
             plan_df, roster, eff_windows = assign_plan_with_rostered_cars(
-                rides_df=s
+                rides_df=s["rides_df"],
+                driver_rows=s["driver_rows"],
+                active_cars=s["active_cars"],
+                service_date=s["service_date"],
+                car_handover=s["car_handover"],
+                soft_early=s["soft_early"],
+                hard_early=s["hard_early"],
+                late_allow=s["late_allow"],
+                auto_relax_to_soft=s["auto_relax"],
+                respect_dates=s["respect_dates"]
+            )
+        except Exception as e:
+            st.error(f"Planning failed: {e}")
+            st.stop()
+
+        # Pretty table (whole day)
+        plan_df.rename(columns={"Assigned Driver":"Allocated Driver", "Car":"Allocated Car"}, inplace=True)
+        cols = ["Pickup Time", "Ride ID", "Pickup", "Dropoff", "Allocated Driver", "Allocated Car", "Notes"]
+        for c in cols:
+            if c not in plan_df.columns:
+                plan_df[c] = ""
+        plan_df = plan_df[cols].copy().sort_values("Pickup Time").reset_index(drop=True)
+
+        st.subheader("Full Day Plan")
+        st.dataframe(plan_df, use_container_width=True, height=620)
+
+        st.download_button(
+            "Download Plan CSV",
+            data=plan_df.to_csv(index=False).encode("utf-8"),
+            file_name="daily_car_plan.csv",
+            mime="text/csv"
+        )
+
+        # Show roster summary
+        st.subheader("Car Roster (one car per driver)")
+        roster_rows = []
+        for name, car in roster.items():
+            st_dt, en_dt = eff_windows[name]
+            roster_rows.append({
+                "Driver": name,
+                "Car": car,
+                "From": st_dt.strftime("%Y-%m-%d %H:%M"),
+                "To": en_dt.strftime("%Y-%m-%d %H:%M")
+            })
+        roster_df = pd.DataFrame(roster_rows).sort_values(["Car","From"])
+        st.dataframe(roster_df, use_container_width=True)
+
+        # BILPLAN export
+        bilplan_text = build_bilplan(plan_df, s["service_date"])
+        st.subheader("BILPLAN")
+        st.text_area("BILPLAN text", bilplan_text, height=320)
+        st.download_button(
+            "Download BILPLAN (.txt)",
+            data=bilplan_text.encode("utf-8"),
+            file_name=f"bilplan_{s['service_date'].isoformat()}.txt",
+            mime="text/plain"
+        )
+else:
+    st.info("Upload the day's rides CSV to start planning.")
