@@ -36,9 +36,12 @@ CAR_POOL = [
     "S-klasse","525","979","516","225"
 ]
 
-# Keywords to detect airport & Copenhagen in free text
 AIRPORT_KW = {"cph", "cph airport", "copenhagen airport", "kastrup", "københavn lufthavn", "kastrup lufthavn"}
 CPH_KW = {"copenhagen", "københavn", "cph", "kastrup", "frederiksberg"}
+
+# Far-away settings (force to 209)
+FAR_DISTANCE_KM = 45.0
+FAR_CAR_ID = "209"
 
 # =========================
 # Data access
@@ -74,24 +77,31 @@ def parse_minutes(value):
     except:
         return None
 
+def parse_float(value):
+    try:
+        if pd.isna(value) or str(value).strip()=="":
+            return None
+        return float(str(value).replace(",", "."))
+    except:
+        return None
+
+def is_far_away_row(row: pd.Series) -> bool:
+    """True if Distance_km >= FAR_DISTANCE_KM (treat as far-away)."""
+    dk = parse_float(row.get("Distance_km"))
+    return (dk is not None) and (dk >= FAR_DISTANCE_KM)
+
 def busy_block_for_row(row: pd.Series) -> timedelta:
     """
-    Extra busy time:
-      - Roadshow / Site Inspection: use Duration Minutes/Hours if given; else Trip + 60.
-      - Far-away: Distance_km > 45 => Trip + (30 if pickup is airport else 0).
+    Busy time for the ride (duration driver is occupied from pickup):
+      - Roadshow / Site Inspection: Duration Minutes/Hours if given; else Trip + 60.
+      - Far-away: Distance_km > FAR_DISTANCE_KM => Trip + (30 if pickup is airport else 0).
       - Else: Trip (or 30 fallback).
     CSV columns used if present:
       Trip Minutes, Distance_km, Pickup, Customer Name, Type, Duration Minutes, Duration Hours
     """
     trip_min = parse_minutes(row.get("Trip Minutes")) or 30
 
-    distance_km = None
-    try:
-        if "Distance_km" in row and str(row["Distance_km"]).strip() != "":
-            distance_km = float(row["Distance_km"])
-    except:
-        distance_km = None
-
+    distance_km = parse_float(row.get("Distance_km"))
     pickup_txt = str(row.get("Pickup", "") or "")
     cust_txt = (str(row.get("Customer Name", "") or "") + " " + str(row.get("Type", "") or "")).lower()
 
@@ -110,7 +120,7 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
         return timedelta(minutes=trip_min + 60)
 
     # Far-away rule
-    if distance_km is not None and distance_km > 45:
+    if distance_km is not None and distance_km >= FAR_DISTANCE_KM:
         extra = 30 if is_airport_pickup(pickup_txt) else 0
         return timedelta(minutes=trip_min + extra)
 
@@ -121,7 +131,7 @@ def rule_gap_after(prev_row: pd.Series, next_row: pd.Series) -> timedelta:
     Extra gap *between* bookings on top of the previous job's busy time.
     Copenhagen-only:
       - If previous pickup was AIRPORT -> +50 min before the next job
-      - If previous pickup was CITY and next pickup is AIRPORT -> +0 min (no extra)
+      - If previous pickup was CITY and next pickup is AIRPORT -> +0 min
       - Else -> +0 min
     """
     prev_pick = str(prev_row.get("Pickup", "") or "")
@@ -164,6 +174,64 @@ def in_flex_window(pickup_dt: datetime, start_dt: datetime, end_dt: datetime,
         return "hard"
     return None
 
+# =========================
+# Car roster (one car per driver per shift)
+# =========================
+def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: timedelta):
+    """
+    Assign exactly ONE car per driver for the entire shift.
+    - Honors preferred_car if possible
+    - If car is still busy, next driver's effective start is pushed to (car_free + handover)
+    Returns:
+      roster: dict name -> car_id
+      effective_windows: dict name -> (effective_start, end)
+    """
+    car_free_at = {car: datetime.min for car in active_cars}
+    roster = {}
+    windows = {}
+
+    def _start_key(r):
+        st = r.get("start")
+        return st if isinstance(st, datetime) else datetime.min
+
+    rows = driver_rows.to_dict("records")
+    rows.sort(key=_start_key)
+
+    for r in rows:
+        name = r["name"]
+        req_start = r.get("start")
+        req_end = r.get("end")
+        if req_start is None or req_end is None:
+            req_start = datetime.combine(date.today(), datetime.strptime("00:00","%H:%M").time())
+            req_end   = datetime.combine(date.today(), datetime.strptime("23:59","%H:%M").time())
+        if req_end <= req_start:
+            req_end = req_end + timedelta(days=1)
+
+        pref = (r.get("preferred_car") or "").strip()
+
+        # Candidate order: preferred first (if any), otherwise choose earliest-free car
+        if pref and pref in active_cars:
+            candidates = [pref] + [c for c in active_cars if c != pref]
+        else:
+            candidates = list(active_cars)
+
+        # pick the car that minimizes delay from requested start
+        best_car = None
+        best_earliest_start = None
+        for car in candidates:
+            earliest_start = max(req_start, car_free_at[car] + handover)  # must respect handover before next shift
+            if best_car is None or earliest_start < best_earliest_start:
+                best_car = car
+                best_earliest_start = earliest_start
+
+        roster[name] = best_car
+        eff_start = best_earliest_start
+        windows[name] = (eff_start, req_end)
+        # After this driver, the car becomes free at their end (handover applied when next driver is chosen)
+        car_free_at[best_car] = req_end
+
+    return roster, windows
+
 def build_bilplan(plan_df: pd.DataFrame, service_date: date) -> str:
     """
     BILPLAN dd/mm/yy
@@ -203,9 +271,9 @@ def build_bilplan(plan_df: pd.DataFrame, service_date: date) -> str:
     return "\n".join(lines)
 
 # =========================
-# Assignment (prefs, shifts, handovers, rules)
+# Assignment (uses roster + far-away->209 rule)
 # =========================
-def assign_plan_with_prefs(
+def assign_plan_with_rostered_cars(
     rides_df: pd.DataFrame,
     driver_rows: pd.DataFrame,
     active_cars: list,
@@ -218,25 +286,22 @@ def assign_plan_with_prefs(
     respect_dates: bool
 ) -> pd.DataFrame:
     """
-    - Per-driver shift window with soft/hard early & late allow (via time_input)
-    - Optional per-driver preferred car; else round-robin across active cars
-    - Enforce car handover buffer
-    - Busy time from busy_block_for_row(row)
-    - EXTRA GAP RULES between jobs (CPH airport/city)
-    - Anchoring: if respect_dates=False or no date provided, anchor times to service_date
+    - Build a car roster (one car per driver for whole shift; shifts may be pushed by car availability + handover)
+    - Assign rides respecting:
+        * driver effective shift window (with soft/hard early & late allow)
+        * driver's rostered car only
+        * far-away rides require FAR_CAR_ID (e.g., 209)
+        * ride busy time + CPH airport/city gap rules (between jobs for the same driver)
     """
     rides = rides_df.copy()
 
-    # Require 'Pickup Time'
+    # parse / anchor pickup times
     if "Pickup Time" not in rides.columns:
         raise ValueError("CSV must include 'Pickup Time' column.")
     rides["Pickup Time"] = pd.to_datetime(rides["Pickup Time"], errors="coerce")
     if rides["Pickup Time"].isna().any():
         raise ValueError("Some 'Pickup Time' values are invalid. Use 'HH:MM' or 'YYYY-MM-DD HH:MM'.")
 
-    # Anchor logic:
-    # - If respect_dates is True and a row has a full date, keep it.
-    # - Otherwise, anchor time to the selected service_date.
     def _anchor(dt: pd.Timestamp) -> datetime:
         if pd.isna(dt):
             return dt
@@ -244,7 +309,6 @@ def assign_plan_with_prefs(
             return dt.to_pydatetime()
         return datetime.combine(service_date, dt.time())
 
-    # If there's an explicit Date column and respect_dates=True, prefer that
     if respect_dates and "Date" in rides.columns and rides["Date"].notna().any():
         try:
             dcol = pd.to_datetime(rides["Date"], errors="coerce").dt.date
@@ -256,53 +320,44 @@ def assign_plan_with_prefs(
 
     rides = rides.sort_values("Pickup Time").reset_index(drop=True)
 
-    # Prepare outputs
+    # outputs
     rides["Assigned Driver"] = ""
     rides["Car"] = ""
     rides["Notes"] = ""
 
-    # Driver state
+    # Build roster
+    roster, effective_windows = build_car_roster(driver_rows, active_cars, handover=car_handover)
+
+    # Per-driver state for job chaining
     states = {}
     for _, r in driver_rows.iterrows():
         name = r["name"]
-        st_dt = r.get("start")
-        en_dt = r.get("end")
-        if st_dt is None or en_dt is None:
-            st_dt = datetime.combine(service_date, datetime.strptime("00:00", "%H:%M").time())
-            en_dt = datetime.combine(service_date, datetime.strptime("23:59", "%H:%M").time())
-        if en_dt <= st_dt:
-            en_dt = en_dt + timedelta(days=1)
+        car = roster.get(name, (r.get("preferred_car") or "").strip())
+        if not car:
+            # Shouldn't happen, but guard
+            continue
+        eff_start, eff_end = effective_windows[name]
+        if eff_end <= eff_start:
+            eff_end = eff_end + timedelta(days=1)
         states[name] = {
-            "start_dt": st_dt,
-            "end_dt":   en_dt,
-            "preferred_car": (r.get("preferred_car") or "").strip(),
+            "car": car,
+            "eff_start": eff_start,
+            "eff_end": eff_end,
             "last_row": None,
         }
 
-    # Car state
-    car_next_free = {car: datetime.min for car in active_cars}
+    # Quick hint if far-away rides exist but FAR_CAR_ID isn't active
+    has_far = any(is_far_away_row(r) for _, r in rides.iterrows())
+    if has_far and FAR_CAR_ID not in active_cars:
+        st.warning(f"Far-away bookings detected but car {FAR_CAR_ID} is not active. Those jobs will not be assigned.")
 
-    # Helper to pick a car for a driver
-    rr_idx = 0
-    def pick_car(for_driver: str, pickup_dt: datetime):
-        nonlocal rr_idx
-        pref = states[for_driver]["preferred_car"]
-        if pref and pref in active_cars and pickup_dt >= car_next_free[pref]:
-            return pref
-        for _ in range(len(active_cars)):
-            car = active_cars[rr_idx]
-            rr_idx = (rr_idx + 1) % len(active_cars)
-            if pickup_dt >= car_next_free[car]:
-                return car
-        return None
-
-    # Driver round-robin order
+    # assign jobs
     driver_names = list(states.keys())
     d_rr = 0
-
     for i, row in rides.iterrows():
         pickup_dt = row["Pickup Time"]
         busy_td = busy_block_for_row(row)
+        far_req = is_far_away_row(row)
 
         feasible = []
         hard_needed = {}
@@ -310,8 +365,17 @@ def assign_plan_with_prefs(
             name = driver_names[d_rr]
             d_rr = (d_rr + 1) % len(driver_names)
 
-            st_dt = states[name]["start_dt"]
-            en_dt = states[name]["end_dt"]
+            car = states[name]["car"]
+            # Enforce far-away->FAR_CAR_ID
+            if far_req:
+                if car != FAR_CAR_ID:
+                    continue
+                if FAR_CAR_ID not in active_cars:
+                    continue  # cannot assign far job at all if 209 inactive
+
+            # shift window with flex (use effective window from roster)
+            st_dt = states[name]["eff_start"]
+            en_dt = states[name]["eff_end"]
             flex = in_flex_window(pickup_dt, st_dt, en_dt, soft_early, hard_early, late_allow)
             if flex is None:
                 if auto_relax_to_soft:
@@ -323,7 +387,7 @@ def assign_plan_with_prefs(
                 else:
                     continue
 
-            # rule-based availability vs last job
+            # chain against last job (gap rules)
             last_row = states[name]["last_row"]
             if last_row is not None:
                 prev_pickup = pd.to_datetime(last_row["Pickup Time"])
@@ -338,35 +402,32 @@ def assign_plan_with_prefs(
             hard_needed[name] = (flex == "hard")
 
         if not feasible:
-            rides.at[i, "Notes"] = "No driver free (window/gap)"
+            if far_req:
+                msg = f"No {FAR_CAR_ID} driver free (window/gap)"
+            else:
+                msg = "No driver free (window/gap)"
+            rides.at[i, "Notes"] = msg
             continue
 
         chosen = feasible[0]
         chosen_hard = hard_needed[chosen]
+        chosen_car = states[chosen]["car"]
 
-        # car choice (handover buffer enforced per-car)
-        car = pick_car(chosen, pickup_dt)
-        if car is None:
-            rides.at[i, "Notes"] = "No car free"
-            continue
-
-        # Update states
+        # lock assignment
         states[chosen]["last_row"] = row.copy()
-
-        # car blocked until busy done + handover
-        next_free_car = pickup_dt + busy_td + car_handover
-        car_next_free[car] = next_free_car
-
-        # Notes & write
         busy_until = pickup_dt + busy_td
+
         note = f"Busy until {busy_until.strftime('%H:%M')}"
         if chosen_hard:
             note += " · Hard Early Start"
+        if far_req and chosen_car != FAR_CAR_ID:
+            # Safety (shouldn't happen due to filters)
+            note += f" · WARNING: far-away not on {FAR_CAR_ID}"
         rides.at[i, "Assigned Driver"] = chosen
-        rides.at[i, "Car"] = car
+        rides.at[i, "Car"] = chosen_car
         rides.at[i, "Notes"] = note
 
-    return rides
+    return rides, roster, effective_windows
 
 # =========================
 # UI (Generate-only updates)
@@ -420,7 +481,7 @@ if rides_file:
 
     # Active cars
     default_active = [c for c in CAR_POOL if c.lower() != "s-klasse"]
-    active_cars_live = st.multiselect("Active cars (handovers allowed via buffer)", CAR_POOL, default=default_active)
+    active_cars_live = st.multiselect("Active cars (one driver per car at a time; handovers allowed)", CAR_POOL, default=default_active)
     if not active_cars_live:
         st.warning("Activate at least one car.")
         st.stop()
@@ -429,12 +490,12 @@ if rides_file:
     st.subheader("Drivers for today")
     all_names = drivers_df["name"].tolist()
     selected_names_live = st.multiselect(
-        "Select drivers (you can select more than active cars)",
+        "Select drivers (you can select more than active cars; roster will queue them on cars)",
         all_names,
-        default=all_names[:min(len(all_names), 10)]
+        default=all_names[:min(len(all_names), 12)]
     )
 
-    st.caption("Optional per-driver settings (leave blank to let allocator decide):")
+    st.caption("Per-driver settings (leave times empty to assume all-day):")
     rows = []
     cols = st.columns(2)
     for i, name in enumerate(selected_names_live):
@@ -443,7 +504,6 @@ if rides_file:
             start_t = st.time_input(f"{name} start", value=None, key=f"start_{name}")
             end_t   = st.time_input(f"{name} end", value=None, key=f"end_{name}")
             pref    = st.selectbox(f"{name} preferred car (optional)", [""] + active_cars_live, index=0, key=f"car_{name}")
-            # Convert to datetimes anchored to service_date (None => all-day)
             start_dt = datetime.combine(service_date, start_t) if start_t else None
             end_dt   = datetime.combine(service_date, end_t) if end_t else None
             rows.append({"name": name, "start": start_dt, "end": end_dt, "preferred_car": pref})
@@ -451,7 +511,7 @@ if rides_file:
 
     # Timing sliders
     with st.expander("Advanced timing (optional)"):
-        hb_min   = st.slider("Car handover buffer (minutes)", 0, 240, 75, 5)
+        hb_min   = st.slider("Car handover buffer between drivers (minutes)", 0, 240, 75, 5)
         soft_min = st.slider("Soft early start allowed (min)", 0, 180, 30, 5)
         hard_min = st.slider("Hard early start allowed (min)", 0, 240, 60, 5)
         late_min = st.slider("Late end allowed (min)", 0, 120, 20, 5)
@@ -460,7 +520,6 @@ if rides_file:
     c1, c2 = st.columns([1,1])
     with c1:
         if st.button("Generate"):
-            # snapshot inputs so UI edits don't auto-rerun result
             st.session_state.snapshot = {
                 "rides_df": rides_df_live.copy(),
                 "service_date": service_date,
@@ -482,48 +541,5 @@ if rides_file:
     if st.session_state.run_plan:
         s = st.session_state.snapshot
         try:
-            plan_df = assign_plan_with_prefs(
-                rides_df=s["rides_df"],
-                driver_rows=s["driver_rows"],
-                active_cars=s["active_cars"],
-                service_date=s["service_date"],
-                car_handover=s["car_handover"],
-                soft_early=s["soft_early"],
-                hard_early=s["hard_early"],
-                late_allow=s["late_allow"],
-                auto_relax_to_soft=s["auto_relax"],
-                respect_dates=s["respect_dates"]
-            )
-        except Exception as e:
-            st.error(f"Planning failed: {e}")
-            st.stop()
-
-        # Ensure columns & show the WHOLE plan
-        plan_df.rename(columns={"Assigned Driver":"Allocated Driver", "Car":"Allocated Car"}, inplace=True)
-        cols = ["Pickup Time", "Ride ID", "Pickup", "Dropoff", "Allocated Driver", "Allocated Car", "Notes"]
-        for c in cols:
-            if c not in plan_df.columns:
-                plan_df[c] = ""
-        plan_df = plan_df[cols].copy().sort_values("Pickup Time").reset_index(drop=True)
-
-        st.subheader("Full Day Plan")
-        st.dataframe(plan_df, use_container_width=True, height=620)
-
-        st.download_button(
-            "Download Plan CSV",
-            data=plan_df.to_csv(index=False).encode("utf-8"),
-            file_name="daily_car_plan.csv",
-            mime="text/csv"
-        )
-
-        bilplan_text = build_bilplan(plan_df, s["service_date"])
-        st.subheader("BILPLAN")
-        st.text_area("BILPLAN text", bilplan_text, height=320)
-        st.download_button(
-            "Download BILPLAN (.txt)",
-            data=bilplan_text.encode("utf-8"),
-            file_name=f"bilplan_{s['service_date'].isoformat()}.txt",
-            mime="text/plain"
-        )
-else:
-    st.info("Upload the day's rides CSV to start planning.")
+            plan_df, roster, eff_windows = assign_plan_with_rostered_cars(
+                rides_df=s
