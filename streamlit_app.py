@@ -3,7 +3,7 @@ import re
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 # =========================
 # Robust DB URL resolution
@@ -44,6 +44,7 @@ CPH_KW = {"copenhagen", "københavn", "cph", "kastrup", "frederiksberg"}
 # Data access
 # =========================
 def load_drivers():
+    """drivers table with columns: driver_id, name, number"""
     with engine.connect() as conn:
         df = pd.read_sql(
             "SELECT driver_id AS id, name, number FROM drivers ORDER BY name",
@@ -163,7 +164,7 @@ def in_flex_window(pickup_dt: datetime, start_dt: datetime, end_dt: datetime,
         return "hard"
     return None
 
-def build_bilplan(plan_df: pd.DataFrame, service_date: datetime.date) -> str:
+def build_bilplan(plan_df: pd.DataFrame, service_date: date) -> str:
     """
     BILPLAN dd/mm/yy
     Name - Car fra HH:MM-HH:MM
@@ -174,8 +175,8 @@ def build_bilplan(plan_df: pd.DataFrame, service_date: datetime.date) -> str:
 
     rows = []
     for _, r in plan_df.iterrows():
-        name = r.get("Assigned Driver","")
-        car = r.get("Car","")
+        name = r.get("Allocated Driver","") or r.get("Assigned Driver","")
+        car = r.get("Allocated Car","") or r.get("Car","")
         if not name or not car:
             continue
         start = pd.to_datetime(r["Pickup Time"])
@@ -208,12 +209,13 @@ def assign_plan_with_prefs(
     rides_df: pd.DataFrame,
     driver_rows: pd.DataFrame,
     active_cars: list,
-    service_date: datetime.date,
+    service_date: date,
     car_handover: timedelta,
     soft_early: int,
     hard_early: int,
     late_allow: int,
-    auto_relax_to_soft: bool
+    auto_relax_to_soft: bool,
+    respect_dates: bool
 ) -> pd.DataFrame:
     """
     - Per-driver shift window with soft/hard early & late allow (via time_input)
@@ -221,6 +223,7 @@ def assign_plan_with_prefs(
     - Enforce car handover buffer
     - Busy time from busy_block_for_row(row)
     - EXTRA GAP RULES between jobs (CPH airport/city)
+    - Anchoring: if respect_dates=False or no date provided, anchor times to service_date
     """
     rides = rides_df.copy()
 
@@ -229,12 +232,27 @@ def assign_plan_with_prefs(
         raise ValueError("CSV must include 'Pickup Time' column.")
     rides["Pickup Time"] = pd.to_datetime(rides["Pickup Time"], errors="coerce")
     if rides["Pickup Time"].isna().any():
-        raise ValueError("Some 'Pickup Time' values are invalid. Use 'YYYY-MM-DD HH:MM' or 'HH:MM' (+Date column).")
+        raise ValueError("Some 'Pickup Time' values are invalid. Use 'HH:MM' or 'YYYY-MM-DD HH:MM'.")
 
-    # Optional 'Date'
-    if "Date" in rides.columns and rides["Date"].notna().any():
-        base_date = pd.to_datetime(rides["Date"], errors="coerce").dt.date
-        rides["Pickup Time"] = pd.to_datetime(base_date.astype(str) + " " + rides["Pickup Time"].dt.strftime("%H:%M"))
+    # Anchor logic:
+    # - If respect_dates is True and a row has a full date, keep it.
+    # - Otherwise, anchor time to the selected service_date.
+    def _anchor(dt: pd.Timestamp) -> datetime:
+        if pd.isna(dt):
+            return dt
+        if respect_dates and (dt.date() != datetime(1970,1,1).date()):
+            return dt.to_pydatetime()
+        return datetime.combine(service_date, dt.time())
+
+    # If there's an explicit Date column and respect_dates=True, prefer that
+    if respect_dates and "Date" in rides.columns and rides["Date"].notna().any():
+        try:
+            dcol = pd.to_datetime(rides["Date"], errors="coerce").dt.date
+            rides["Pickup Time"] = pd.to_datetime(dcol.astype(str) + " " + rides["Pickup Time"].dt.strftime("%H:%M"))
+        except Exception:
+            rides["Pickup Time"] = rides["Pickup Time"].apply(_anchor)
+    else:
+        rides["Pickup Time"] = rides["Pickup Time"].apply(_anchor)
 
     rides = rides.sort_values("Pickup Time").reset_index(drop=True)
 
@@ -369,6 +387,26 @@ if "snapshot" not in st.session_state:
 # Upload rides CSV
 rides_file = st.file_uploader("Upload today's rides CSV", type=["csv"])
 
+def _infer_service_date(df: pd.DataFrame):
+    # If Date column exists, use its mode
+    if "Date" in df.columns and df["Date"].notna().any():
+        try:
+            d = pd.to_datetime(df["Date"], errors="coerce").dt.date.dropna()
+            if not d.empty:
+                return d.mode().iloc[0]
+        except Exception:
+            pass
+    # Else, if Pickup Time includes real dates, use mode
+    if "Pickup Time" in df.columns:
+        try:
+            pt = pd.to_datetime(df["Pickup Time"], errors="coerce")
+            dates = pt.dt.date.dropna()
+            if not dates.empty:
+                return dates.mode().iloc[0]
+        except Exception:
+            pass
+    return datetime.now().date()
+
 if rides_file:
     try:
         rides_df_live = pd.read_csv(rides_file).fillna("")
@@ -376,7 +414,9 @@ if rides_file:
         st.error(f"Failed to read CSV: {e}")
         st.stop()
 
-    service_date = st.date_input("Service date", value=datetime.now().date())
+    inferred_date = _infer_service_date(rides_df_live)
+    service_date = st.date_input("Service date", value=inferred_date)
+    respect_dates = st.checkbox("Respect dates in file (keep them if present)", value=True)
 
     # Active cars
     default_active = [c for c in CAR_POOL if c.lower() != "s-klasse"]
@@ -424,6 +464,7 @@ if rides_file:
             st.session_state.snapshot = {
                 "rides_df": rides_df_live.copy(),
                 "service_date": service_date,
+                "respect_dates": bool(respect_dates),
                 "active_cars": list(active_cars_live),
                 "driver_rows": driver_rows_live.copy(),
                 "car_handover": timedelta(minutes=int(hb_min)),
@@ -450,16 +491,16 @@ if rides_file:
                 soft_early=s["soft_early"],
                 hard_early=s["hard_early"],
                 late_allow=s["late_allow"],
-                auto_relax_to_soft=s["auto_relax"]
+                auto_relax_to_soft=s["auto_relax"],
+                respect_dates=s["respect_dates"]
             )
         except Exception as e:
             st.error(f"Planning failed: {e}")
             st.stop()
 
         # Ensure columns & show the WHOLE plan
-        cols = ["Pickup Time", "Ride ID", "Pickup", "Dropoff", "Allocated Driver", "Allocated Car", "Notes"]
-        # Rename for nicer headers
         plan_df.rename(columns={"Assigned Driver":"Allocated Driver", "Car":"Allocated Car"}, inplace=True)
+        cols = ["Pickup Time", "Ride ID", "Pickup", "Dropoff", "Allocated Driver", "Allocated Car", "Notes"]
         for c in cols:
             if c not in plan_df.columns:
                 plan_df[c] = ""
@@ -475,7 +516,7 @@ if rides_file:
             mime="text/csv"
         )
 
-        bilplan_text = build_bilplan(plan_df.rename(columns={"Allocated Driver":"Assigned Driver", "Allocated Car":"Car"}), s["service_date"])
+        bilplan_text = build_bilplan(plan_df, s["service_date"])
         st.subheader("BILPLAN")
         st.text_area("BILPLAN text", bilplan_text, height=320)
         st.download_button(
