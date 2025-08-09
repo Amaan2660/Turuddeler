@@ -471,7 +471,7 @@ def get_booking_id(row: pd.Series) -> str:
             return str(row[k]).strip()
     return ""
 
-# normalize pickup/dropoff column names if the CSV uses alternatives
+# normalize/mirror columns to the names we use in the UI
 def ensure_column(df: pd.DataFrame, target: str, cands: list):
     if target in df.columns:
         return
@@ -627,15 +627,20 @@ if rides_file:
             st.error(f"Planning failed: {e}")
             st.stop()
 
-        # Normalize pickup/dropoff names for display if CSV used alternatives
-        ensure_column(plan_df, "Pickup", ["Pickup Address","From","Start","Start Address","PickupLocation","Pickup Loc"])
-        ensure_column(plan_df, "Dropoff", ["Dropoff Address","To","End","End Address","DropoffLocation","Dropoff Loc"])
+        # Normalize columns exactly as requested:
+        # Pickup := "Pick up"
+        # Dropoff := "Drop off"
+        ensure_column(plan_df, "Pickup", ["Pick up","Pickup Address","From","Start","Start Address","PickupLocation","Pickup Loc"])
+        ensure_column(plan_df, "Dropoff", ["Drop off","Dropoff Address","To","End","End Address","DropoffLocation","Dropoff Loc"])
 
-        # Pretty table (whole day) with Booking ID from Ref No, Pickup & Dropoff
+        # Name := "Pax Name"
+        ensure_column(plan_df, "Name", ["Pax Name","Passenger Name","PAX","Pax","Client Name","Customer Name"])
+
+        # Pretty table (whole day) with Booking ID from Ref No, Name, Pickup & Dropoff
         plan_df.rename(columns={"Assigned Driver":"Allocated Driver", "Car":"Allocated Car"}, inplace=True)
 
         # Ensure columns used below exist
-        for c in ["Pickup Time","Pickup","Dropoff","Allocated Driver","Allocated Car","Notes","Ref No","Ride ID","Booking ID","Customer Name"]:
+        for c in ["Pickup Time","Pickup","Dropoff","Allocated Driver","Allocated Car","Notes","Ref No","Ride ID","Booking ID","Name"]:
             if c not in plan_df.columns:
                 plan_df[c] = ""
 
@@ -644,8 +649,8 @@ if rides_file:
 
         display_cols = [
             "Pickup Time",
-            "Booking ID",        # from Ref No
-            "Customer Name",
+            "Booking ID",   # from Ref No
+            "Name",         # from Pax Name
             "Pickup",
             "Dropoff",
             "Allocated Driver",
