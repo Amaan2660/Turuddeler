@@ -173,6 +173,20 @@ def in_flex_window(pickup_dt: datetime, start_dt: datetime, end_dt: datetime,
         return "hard"
     return None
 
+# ---- Cancelled bookings helper ----
+CANCEL_MATCHES = ("cancel", "cancelled", "canceled", "no show", "noshow")
+
+def row_is_cancelled(row: pd.Series) -> bool:
+    for col in row.index:
+        col_l = str(col).lower()
+        if col_l in ("status", "booking status", "state", "cancelled", "canceled"):
+            val = str(row[col]).strip().lower()
+            if val in ("1", "true", "yes", "y"):
+                return True
+            if any(tok in val for tok in CANCEL_MATCHES):
+                return True
+    return False
+
 # =========================
 # Car roster (one car per driver per shift)
 # =========================
@@ -294,7 +308,12 @@ def assign_plan_with_rostered_cars(
         * far-away rides require FAR_CAR_ID (e.g., 209)
         * ride busy time + CPH airport/city gap rules (between jobs for the same driver)
     """
+    # Safety: drop cancelled / no-show rows if the caller forgot to filter
     rides = rides_df.copy()
+    try:
+        rides = rides[~rides.apply(row_is_cancelled, axis=1)].copy()
+    except Exception:
+        pass
 
     # parse / anchor pickup times
     if "Pickup Time" not in rides.columns:
@@ -432,6 +451,25 @@ def assign_plan_with_rostered_cars(
     return rides, roster, effective_windows
 
 # =========================
+# Booking ID + VIP helpers for display
+# =========================
+def get_booking_id(row: pd.Series) -> str:
+    for k in ("Ride ID","Booking ID","BookingID","ID","Id","id"):
+        if k in row and str(row[k]).strip() != "":
+            return str(row[k]).strip()
+    return ""
+
+def is_vip_customer(row: pd.Series) -> bool:
+    for k in ("VIP","Vip","vip","Customer Level","Level","Customer Type","Type"):
+        if k in row:
+            val = str(row[k]).strip().lower()
+            if val in ("1","true","yes","y","vip","super vip","v.i.p"):
+                return True
+            if "vip" in val:
+                return True
+    return False
+
+# =========================
 # UI (Generate-only updates)
 # =========================
 st.set_page_config(page_title="🚖 Daily Car Plan", page_icon="🚗", layout="wide")
@@ -476,6 +514,16 @@ if rides_file:
     except Exception as e:
         st.error(f"Failed to read CSV: {e}")
         st.stop()
+
+    # Drop cancelled / no-show bookings early
+    _pre = len(rides_df_live)
+    try:
+        rides_df_live = rides_df_live[~rides_df_live.apply(row_is_cancelled, axis=1)].copy()
+    except Exception:
+        pass
+    _post = len(rides_df_live)
+    if _pre != _post:
+        st.info(f"Filtered {_pre - _post} cancelled/no-show booking(s).")
 
     inferred_date = _infer_service_date(rides_df_live)
     service_date = st.date_input("Service date", value=inferred_date)
@@ -567,36 +615,69 @@ if rides_file:
             st.error(f"Planning failed: {e}")
             st.stop()
 
-        # Pretty table (whole day)
+        # Pretty table (whole day) with Booking ID, VIP, Pickup, Dropoff
         plan_df.rename(columns={"Assigned Driver":"Allocated Driver", "Car":"Allocated Car"}, inplace=True)
-        cols = ["Pickup Time", "Ride ID", "Pickup", "Dropoff", "Allocated Driver", "Allocated Car", "Notes"]
-        for c in cols:
+
+        # Ensure base columns exist
+        for c in ["Pickup Time","Ride ID","Booking ID","Pickup","Dropoff","Customer Name","Allocated Driver","Allocated Car","Notes"]:
             if c not in plan_df.columns:
                 plan_df[c] = ""
-        plan_df = plan_df[cols].copy().sort_values("Pickup Time").reset_index(drop=True)
+
+        # Derive Booking ID + VIP flag
+        plan_df["Booking ID"] = plan_df.apply(get_booking_id, axis=1)
+        plan_df["VIP"] = plan_df.apply(lambda r: "Yes" if is_vip_customer(r) else "", axis=1)
+
+        display_cols = [
+            "Pickup Time",
+            "Booking ID",
+            "VIP",
+            "Customer Name",
+            "Pickup",
+            "Dropoff",
+            "Allocated Driver",
+            "Allocated Car",
+            "Notes",
+        ]
+        display_cols = [c for c in display_cols if c in plan_df.columns]
+
+        plan_df_display = plan_df[display_cols].copy().sort_values("Pickup Time").reset_index(drop=True)
 
         st.subheader("Full Day Plan")
-        st.dataframe(plan_df, use_container_width=True, height=620)
+        st.dataframe(plan_df_display, use_container_width=True, height=900)
 
         st.download_button(
             "Download Plan CSV",
-            data=plan_df.to_csv(index=False).encode("utf-8"),
+            data=plan_df_display.to_csv(index=False).encode("utf-8"),
             file_name="daily_car_plan.csv",
             mime="text/csv"
         )
 
-        # Show roster summary
+        # Show roster summary (safe formatting)
         st.subheader("Car Roster (one car per driver)")
+
+        def _fmt_dt(dt):
+            try:
+                if isinstance(dt, pd.Timestamp):
+                    dt = dt.to_pydatetime()
+                return dt.strftime("%Y-%m-%d %H:%M") if isinstance(dt, datetime) else ""
+            except Exception:
+                return ""
+
         roster_rows = []
         for name, car in roster.items():
-            st_dt, en_dt = eff_windows[name]
+            st_dt, en_dt = eff_windows.get(name, (None, None))
             roster_rows.append({
                 "Driver": name,
-                "Car": car,
-                "From": st_dt.strftime("%Y-%m-%d %H:%M"),
-                "To": en_dt.strftime("%Y-%m-%d %H:%M")
+                "Car": car or "",
+                "From": _fmt_dt(st_dt),
+                "To": _fmt_dt(en_dt),
             })
-        roster_df = pd.DataFrame(roster_rows).sort_values(["Car","From"])
+
+        roster_df = pd.DataFrame(roster_rows)
+        if not roster_df.empty:
+            roster_df["Car"] = roster_df["Car"].fillna("")
+            roster_df["From"] = roster_df["From"].fillna("")
+            roster_df = roster_df.sort_values(["Car","From"])
         st.dataframe(roster_df, use_container_width=True)
 
         # BILPLAN export
