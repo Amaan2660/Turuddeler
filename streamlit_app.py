@@ -76,31 +76,43 @@ def parse_minutes(value):
     except:
         return None
 
-def parse_float(value):
+def parse_float_maybe(value):
     try:
-        if pd.isna(value) or str(value).strip()=="":
-            return None
-        return float(str(value).replace(",", "."))
+        if value is None: return None
+        s = str(value).strip()
+        if s == "": return None
+        return float(s.replace(",", "."))
     except:
         return None
 
+# --- distance detection (scan common headers) ---
+DISTANCE_CANDIDATES = [
+    "Distance_km","Distance (km)","KM","Km","km","distance","distance km","Total Km","Total_km"
+]
+def get_distance_km(row: pd.Series):
+    for k in DISTANCE_CANDIDATES:
+        if k in row:
+            v = parse_float_maybe(row[k])
+            if v is not None:
+                return v
+    return None
+
 def is_far_away_row(row: pd.Series) -> bool:
-    """True if Distance_km >= FAR_DISTANCE_KM (treat as far-away)."""
-    dk = parse_float(row.get("Distance_km"))
+    dk = get_distance_km(row)
     return (dk is not None) and (dk >= FAR_DISTANCE_KM)
 
 def busy_block_for_row(row: pd.Series) -> timedelta:
     """
     Busy time for the ride (duration driver is occupied from pickup):
       - Roadshow / Site Inspection: Duration Minutes/Hours if given; else Trip + 60.
-      - Far-away: Distance_km >= FAR_DISTANCE_KM => Trip + (30 if pickup is airport else 0).
+      - Far-away: km >= FAR_DISTANCE_KM => Trip + (30 if pickup is airport else 0).
       - Else: Trip (or 30 fallback).
-    CSV columns used if present:
-      Trip Minutes, Distance_km, Pickup, Customer Name, Type, Duration Minutes, Duration Hours
+    Uses:
+      Trip Minutes, *distance variants*, Pickup, Customer Name, Type, Duration Minutes, Duration Hours
     """
     trip_min = parse_minutes(row.get("Trip Minutes")) or 30
 
-    distance_km = parse_float(row.get("Distance_km"))
+    distance_km = get_distance_km(row)
     pickup_txt = str(row.get("Pickup", "") or "")
     cust_txt = (str(row.get("Customer Name", "") or "") + " " + str(row.get("Type", "") or "")).lower()
 
@@ -175,7 +187,6 @@ def in_flex_window(pickup_dt: datetime, start_dt: datetime, end_dt: datetime,
 
 # ---- Cancelled bookings helper ----
 CANCEL_MATCHES = ("cancel", "cancelled", "canceled", "no show", "noshow")
-
 def row_is_cancelled(row: pd.Series) -> bool:
     for col in row.index:
         col_l = str(col).lower()
@@ -451,23 +462,24 @@ def assign_plan_with_rostered_cars(
     return rides, roster, effective_windows
 
 # =========================
-# Booking ID + VIP helpers for display
+# Booking ID helper (use Ref No)
 # =========================
+ID_CANDIDATES = ("Ref No","Ride ID","Booking ID","BookingID","ID","Id","id")
 def get_booking_id(row: pd.Series) -> str:
-    for k in ("Ride ID","Booking ID","BookingID","ID","Id","id"):
+    for k in ID_CANDIDATES:
         if k in row and str(row[k]).strip() != "":
             return str(row[k]).strip()
     return ""
 
-def is_vip_customer(row: pd.Series) -> bool:
-    for k in ("VIP","Vip","vip","Customer Level","Level","Customer Type","Type"):
-        if k in row:
-            val = str(row[k]).strip().lower()
-            if val in ("1","true","yes","y","vip","super vip","v.i.p"):
-                return True
-            if "vip" in val:
-                return True
-    return False
+# normalize pickup/dropoff column names if the CSV uses alternatives
+def ensure_column(df: pd.DataFrame, target: str, cands: list):
+    if target in df.columns:
+        return
+    for c in cands:
+        if c in df.columns:
+            df[target] = df[c]
+            return
+    df[target] = ""  # fallback
 
 # =========================
 # UI (Generate-only updates)
@@ -615,22 +627,24 @@ if rides_file:
             st.error(f"Planning failed: {e}")
             st.stop()
 
-        # Pretty table (whole day) with Booking ID, VIP, Pickup, Dropoff
+        # Normalize pickup/dropoff names for display if CSV used alternatives
+        ensure_column(plan_df, "Pickup", ["Pickup Address","From","Start","Start Address","PickupLocation","Pickup Loc"])
+        ensure_column(plan_df, "Dropoff", ["Dropoff Address","To","End","End Address","DropoffLocation","Dropoff Loc"])
+
+        # Pretty table (whole day) with Booking ID from Ref No, Pickup & Dropoff
         plan_df.rename(columns={"Assigned Driver":"Allocated Driver", "Car":"Allocated Car"}, inplace=True)
 
-        # Ensure base columns exist
-        for c in ["Pickup Time","Ride ID","Booking ID","Pickup","Dropoff","Customer Name","Allocated Driver","Allocated Car","Notes"]:
+        # Ensure columns used below exist
+        for c in ["Pickup Time","Pickup","Dropoff","Allocated Driver","Allocated Car","Notes","Ref No","Ride ID","Booking ID","Customer Name"]:
             if c not in plan_df.columns:
                 plan_df[c] = ""
 
-        # Derive Booking ID + VIP flag
+        # Derive Booking ID from Ref No (fallbacks included)
         plan_df["Booking ID"] = plan_df.apply(get_booking_id, axis=1)
-        plan_df["VIP"] = plan_df.apply(lambda r: "Yes" if is_vip_customer(r) else "", axis=1)
 
         display_cols = [
             "Pickup Time",
-            "Booking ID",
-            "VIP",
+            "Booking ID",        # from Ref No
             "Customer Name",
             "Pickup",
             "Dropoff",
