@@ -48,6 +48,13 @@ CPH_KW = {"copenhagen", "københavn", "cph", "kastrup", "frederiksberg"}
 FAR_DISTANCE_KM = 45.0
 FAR_CAR_ID = "209"
 
+# Default type→type gap matrix (minutes)
+DEFAULT_GAP_MATRIX = {
+    "C2C": {"C2C": 25, "A2C": 30, "C2A": 25},
+    "A2C": {"C2C": 50, "A2C": 50, "C2A": 50},
+    "C2A": {"C2C": 50, "A2C": 0,  "C2A": 40},
+}
+
 # Column candidates (NOTE: "Drop Off" is first for destination)
 PICKUP_CANDIDATES  = [
     "Pickup","Pick Up","Pick up","Pickup Address","From","Start",
@@ -338,14 +345,14 @@ def build_bilplan(plan_df: pd.DataFrame, service_date: date) -> str:
     agg = tmp.groupby(["name","car"]).agg(start=("start","min"), end=("end","max")).reset_index()
     agg = agg.sort_values(["car","start"]).reset_index(drop=True)
 
-    lines = [f"BILPLAN {service_date.strftime('%d/%m/%y')}"]
+    lines = [f"BILPLAN {service_date.strftime('%d/%m/%y']}"]
     for _, r in agg.iterrows():
         span = f"{r['start'].strftime('%H:%M')}-{r['end'].strftime('%H:%M')}"
         lines.append(f"{r['name']} - {r['car']} fra {span}")
     return "\n".join(lines)
 
 # =========================
-# Assignment (active list + round-robin cursor + gaps)
+# Assignment (active list + round-robin cursor + fair by shift-hours)
 # =========================
 def assign_plan_with_rostered_cars(
     rides_df: pd.DataFrame,
@@ -364,10 +371,11 @@ def assign_plan_with_rostered_cars(
 ):
     """
     Live round-robin:
-      - Maintain an ACTIVE list based on shift start/end.
+      - Maintain ACTIVE list based on shift start/end.
       - For each ride, scan ACTIVE starting at cursor, wrap around.
-      - Choose among feasible by lowest load-per-hour; tie: closest ahead of cursor.
-      - Advance cursor ONLY when someone is assigned. Never drop someone for being infeasible.
+      - Choose among feasible by lowest load-per-hour (count / shift_hours);
+        tie: closest ahead of cursor.
+      - Advance cursor ONLY when someone is assigned.
     """
     # 1) Preprocess rides
     rides = rides_df.copy()
@@ -449,7 +457,6 @@ def assign_plan_with_rostered_cars(
             if st_dt <= now_dt < en_dt:
                 active.append(nm)
                 in_active.add(nm)
-                # do NOT change cursor
 
         # Remove who ended before/at now
         i = 0
@@ -507,7 +514,7 @@ def assign_plan_with_rostered_cars(
             if far_req and car != FAR_CAR_ID:
                 continue
 
-            # window flex (should be inside shift already, but keep check)
+            # window flex (inside shift, but keep check)
             st_dt = states[nm]["eff_start"]
             en_dt = states[nm]["eff_end"]
             flex = in_flex_window(pickup_dt, st_dt, en_dt, soft_early, hard_early, late_allow)
@@ -517,14 +524,13 @@ def assign_plan_with_rostered_cars(
                     soft_end   = en_dt + timedelta(minutes=late_allow)
                     if not (soft_start <= pickup_dt <= soft_end):
                         continue
-                    # treat as soft
                 else:
                     continue
 
             # chaining via type->type gap
             last_row = states[nm]["last_row"]
             if last_row is not None:
-                extra_gap = rule_gap_after(last_row, row, gap_matrix, gap_cph_only)
+                extra_gap = rule_gap_after(last_row, row, DEFAULT_GAP_MATRIX if gap_matrix is None else gap_matrix, gap_cph_only)
                 prev_pick = pd.to_datetime(last_row["Pickup Time"])
                 if use_gap_only:
                     earliest_next = prev_pick + extra_gap
@@ -546,8 +552,7 @@ def assign_plan_with_rostered_cars(
 
         if not feasible:
             rides.at[i, "Notes"] = "No driver free (window/gap)"
-            # IMPORTANT: do NOT move cursor when no one was assigned
-            continue
+            continue  # cursor unchanged
 
         # Choose: lowest load ratio; tie -> closest ahead of cursor
         feasible.sort(key=lambda t: (t[1], t[2]))
@@ -705,7 +710,7 @@ if rides_file:
         auto_relax = st.checkbox("If a job is unassigned for window only, auto-relax to SOFT", value=True)
         use_gap_only = st.checkbox("Use gaps only for chaining (ignore Trip Minutes)", value=True)
 
-    # 3×3 TYPE➜TYPE gap matrix (C2C, A2C, C2A)
+    # 3×3 TYPE➜TYPE gap matrix (C2C, A2C, C2A) with DEFAULTS
     with st.expander("Gap rules between booking TYPES (prev ➜ next)"):
         st.caption("Types: C2C (City→City), A2C (Airport→City), C2A (City→Airport)")
         gap_cph_only = st.checkbox("Apply gaps only when both pickups are in the CPH area", value=False)
@@ -716,7 +721,13 @@ if rides_file:
             gap_matrix[r] = {}
             row_cols = st.columns(len(types))
             for j, c in enumerate(types):
-                gap_matrix[r][c] = row_cols[j].number_input(f"{r} ➜ {c}", 0, 240, 0, 5, key=f"gap_{r}_{c}")
+                default_val = int(DEFAULT_GAP_MATRIX.get(r, {}).get(c, 0))
+                gap_matrix[r][c] = row_cols[j].number_input(
+                    f"{r} ➜ {c}",
+                    min_value=0, max_value=240,
+                    value=default_val, step=5,
+                    key=f"gap_{r}_{c}"
+                )
 
     col_run, col_clear = st.columns(2)
     with col_run:
