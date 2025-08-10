@@ -137,13 +137,11 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
 
     return timedelta(minutes=trip_min)
 
-def rule_gap_after(prev_row: pd.Series, next_row: pd.Series) -> timedelta:
+def rule_gap_after(prev_row: pd.Series, next_row: pd.Series, gaps: dict) -> timedelta:
     """
     Extra gap *between* bookings on top of the previous job's busy time.
-    Copenhagen-only:
-      - If previous pickup was AIRPORT -> +50 min before the next job
-      - If previous pickup was CITY and next pickup is AIRPORT -> +0 min
-      - Else -> +0 min
+    Copenhagen-only (if both legs are in CPH area).
+    gaps dict keys: 'A2A','A2C','C2A','C2C'  (minutes)
     """
     prev_pick = str(prev_row.get("Pickup", "") or "")
     prev_drop = str(prev_row.get("Dropoff", "") or "")
@@ -156,11 +154,13 @@ def rule_gap_after(prev_row: pd.Series, next_row: pd.Series) -> timedelta:
     prev_is_airport = is_airport_pickup(prev_pick)
     next_is_airport = is_airport_pickup(next_pick)
 
-    if prev_is_airport:
-        return timedelta(minutes=50)
+    if prev_is_airport and next_is_airport:
+        return timedelta(minutes=int(gaps.get("A2A", 50)))
+    if prev_is_airport and not next_is_airport:
+        return timedelta(minutes=int(gaps.get("A2C", 0)))
     if (not prev_is_airport) and next_is_airport:
-        return timedelta(0)
-    return timedelta(0)
+        return timedelta(minutes=int(gaps.get("C2A", 0)))
+    return timedelta(minutes=int(gaps.get("C2C", 0)))
 
 def extract_busy_until(note: str):
     if not note: return None
@@ -309,7 +309,8 @@ def assign_plan_with_rostered_cars(
     hard_early: int,
     late_allow: int,
     auto_relax_to_soft: bool,
-    respect_dates: bool
+    respect_dates: bool,
+    gap_matrix: dict
 ):
     """
     - Build a car roster (one car per driver for whole shift; shifts may be pushed by car availability + handover)
@@ -317,7 +318,7 @@ def assign_plan_with_rostered_cars(
         * driver effective shift window (with soft/hard early & late allow)
         * driver's rostered car only
         * far-away rides require FAR_CAR_ID (e.g., 209)
-        * ride busy time + CPH airport/city gap rules (between jobs for the same driver)
+        * ride busy time + CPH airport/city **custom gap** rules (between jobs for the same driver)
     """
     # Safety: drop cancelled / no-show rows if the caller forgot to filter
     rides = rides_df.copy()
@@ -363,10 +364,8 @@ def assign_plan_with_rostered_cars(
     states = {}
     for _, r in driver_rows.iterrows():
         name = r["name"]
-        # chosen car from roster (or the optional preferred)
         car = roster.get(name, (r.get("preferred_car") or "").strip())
         if not car:
-            # no car could be assigned (shouldn't happen if active_cars not empty)
             continue
         eff_start, eff_end = effective_windows[name]
         if eff_end <= eff_start:
@@ -404,7 +403,7 @@ def assign_plan_with_rostered_cars(
                 if car != FAR_CAR_ID:
                     continue
                 if FAR_CAR_ID not in active_cars:
-                    continue  # cannot assign far job at all if 209 inactive
+                    continue
 
             # shift window with flex (use effective window from roster)
             st_dt = states[name]["eff_start"]
@@ -426,7 +425,7 @@ def assign_plan_with_rostered_cars(
                 prev_pickup = pd.to_datetime(last_row["Pickup Time"])
                 prev_busy = busy_block_for_row(last_row)
                 prev_finish = prev_pickup + prev_busy
-                extra_gap = rule_gap_after(last_row, row)
+                extra_gap = rule_gap_after(last_row, row, gap_matrix)
                 earliest_next = prev_finish + extra_gap
                 if pickup_dt < earliest_next:
                     continue
@@ -435,11 +434,7 @@ def assign_plan_with_rostered_cars(
             hard_needed[name] = (flex == "hard")
 
         if not feasible:
-            if far_req:
-                msg = f"No {FAR_CAR_ID} driver free (window/gap)"
-            else:
-                msg = "No driver free (window/gap)"
-            rides.at[i, "Notes"] = msg
+            rides.at[i, "Notes"] = ("No " + FAR_CAR_ID + " driver free (window/gap)") if far_req else "No driver free (window/gap)"
             continue
 
         chosen = feasible[0]
@@ -587,6 +582,17 @@ if rides_file:
         late_min = st.slider("Late end allowed (min)", 0, 120, 20, 5)
         auto_relax = st.checkbox("If a job is unassigned for window only, auto-relax to SOFT", value=True)
 
+    # NEW: CPH gap matrix (custom minutes)
+    with st.expander("CPH gap rules between bookings (minutes)"):
+        c1, c2 = st.columns(2)
+        with c1:
+            gap_a2a = st.number_input("Airport ➜ Airport", 0, 240, 50, 5)
+            gap_a2c = st.number_input("Airport ➜ City",    0, 240, 50, 5)
+        with c2:
+            gap_c2a = st.number_input("City ➜ Airport",    0, 240, 0, 5)
+            gap_c2c = st.number_input("City ➜ City",       0, 240, 0, 5)
+        gap_matrix = {"A2A": int(gap_a2a), "A2C": int(gap_a2c), "C2A": int(gap_c2a), "C2C": int(gap_c2c)}
+
     col_run, col_clear = st.columns(2)
     with col_run:
         if st.button("Generate"):
@@ -601,6 +607,7 @@ if rides_file:
                 "hard_early": int(hard_min),
                 "late_allow": int(late_min),
                 "auto_relax": bool(auto_relax),
+                "gap_matrix": gap_matrix,
             }
             st.session_state.run_plan = True
     with col_clear:
@@ -621,17 +628,18 @@ if rides_file:
                 hard_early=s["hard_early"],
                 late_allow=s["late_allow"],
                 auto_relax_to_soft=s["auto_relax"],
-                respect_dates=s["respect_dates"]
+                respect_dates=s["respect_dates"],
+                gap_matrix=s["gap_matrix"]
             )
         except Exception as e:
             st.error(f"Planning failed: {e}")
             st.stop()
 
-        # Normalize columns exactly as requested:
-        # Pickup := "Pick up"
+        # Map columns EXACTLY as you asked:
+        # Pickup := "Pick Up"
         # Dropoff := "Drop off"
-        ensure_column(plan_df, "Pickup", ["Pick up","Pickup Address","From","Start","Start Address","PickupLocation","Pickup Loc"])
-        ensure_column(plan_df, "Dropoff", ["Drop off","Dropoff Address","To","End","End Address","DropoffLocation","Dropoff Loc"])
+        ensure_column(plan_df, "Pickup", ["Pick Up","Pick up","Pickup","Pickup Address","From","Start","Start Address","PickupLocation","Pickup Loc"])
+        ensure_column(plan_df, "Dropoff", ["Drop off","Dropoff","Dropoff Address","To","End","End Address","DropoffLocation","Dropoff Loc"])
 
         # Name := "Pax Name"
         ensure_column(plan_df, "Name", ["Pax Name","Passenger Name","PAX","Pax","Client Name","Customer Name"])
