@@ -42,6 +42,16 @@ CPH_KW = {"copenhagen", "københavn", "cph", "kastrup", "frederiksberg"}
 FAR_DISTANCE_KM = 45.0
 FAR_CAR_ID = "209"
 
+# Column candidates (so logic works before we normalize headers)
+PICKUP_CANDIDATES  = ["Pickup","Pick Up","Pick up","Pickup Address","From","Start","Start Address","PickupLocation","Pickup Loc"]
+DROPOFF_CANDIDATES = ["Dropoff","Drop off","Dropoff Address","To","End","End Address","DropoffLocation","Dropoff Loc"]
+
+def _get_first_present(row: pd.Series, candidates) -> str:
+    for c in candidates:
+        if c in row and str(row[c]).strip() != "":
+            return str(row[c])
+    return ""
+
 # =========================
 # Data access
 # =========================
@@ -105,6 +115,32 @@ def is_far_away_row(row: pd.Series) -> bool:
     dk = get_distance_km(row)
     return (dk is not None) and (dk >= FAR_DISTANCE_KM)
 
+def get_pickup_text(row: pd.Series) -> str:
+    return _get_first_present(row, PICKUP_CANDIDATES)
+
+def get_dropoff_text(row: pd.Series) -> str:
+    return _get_first_present(row, DROPOFF_CANDIDATES)
+
+def booking_type(row: pd.Series) -> str:
+    """
+    Classify a single booking into route type:
+      C2A: City -> Airport
+      A2C: Airport -> City
+      A2A: Airport -> Airport
+      C2C: City -> City
+    """
+    pick = get_pickup_text(row)
+    drop = get_dropoff_text(row)
+    pick_air = is_airport_place(pick)
+    drop_air = is_airport_place(drop)
+    if pick_air and drop_air:
+        return "A2A"
+    if pick_air and not drop_air:
+        return "A2C"
+    if not pick_air and drop_air:
+        return "C2A"
+    return "C2C"
+
 def busy_block_for_row(row: pd.Series) -> timedelta:
     """
     Busy time for the ride (duration driver is occupied from pickup):
@@ -117,7 +153,7 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
     trip_min = parse_minutes(row.get("Trip Minutes")) or 30
 
     distance_km = get_distance_km(row)
-    pickup_txt = str(row.get("Pickup", "") or "")
+    pickup_txt = get_pickup_text(row)
     cust_txt = (str(row.get("Customer Name", "") or "") + " " + str(row.get("Type", "") or "")).lower()
 
     # Roadshow / Site Inspection
@@ -141,39 +177,28 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
 
     return timedelta(minutes=trip_min)
 
-def rule_gap_after(prev_row: pd.Series, next_row: pd.Series, gaps: dict) -> timedelta:
+def rule_gap_after(prev_row: pd.Series, next_row: pd.Series, gap_matrix: dict, cph_only: bool) -> timedelta:
     """
     Extra gap *between* bookings on top of the previous job's busy time.
 
-    Logic keys off where the previous job ENDED (prev dropoff) and where the NEXT job
-    STARTS (next pickup):
+    Gaps are defined by **route type of previous booking ➜ route type of next booking**:
+      Types: C2A, A2C, A2A, C2C
+      Example: gap_matrix["C2A"]["C2A"] = 40  (after a City→Airport, the next City→Airport needs 40 min)
 
-        A2A: prev ended at Airport  -> next pickup at Airport
-        A2C: prev ended at Airport  -> next pickup in City
-        C2A: prev ended in City     -> next pickup at Airport
-        C2C: prev ended in City     -> next pickup in City
-
-    Copenhagen-only (both legs must be in CPH area for the rule to apply).
+    If cph_only is True, apply these gaps only when both *pickups* are in the CPH area.
     """
-    prev_pick = str(prev_row.get("Pickup", "") or "")
-    prev_drop = str(prev_row.get("Dropoff", "") or "")
-    next_pick = str(next_row.get("Pickup", "") or "")
-    next_drop = str(next_row.get("Dropoff", "") or "")
+    if cph_only:
+        prev_pick = get_pickup_text(prev_row)
+        next_pick = get_pickup_text(next_row)
+        if not (is_copenhagen(prev_pick, prev_pick) and is_copenhagen(next_pick, next_pick)):
+            return timedelta(0)
 
-    # only apply these micro-gaps for CPH-area legs
-    if not is_copenhagen(prev_pick, prev_drop) or not is_copenhagen(next_pick, next_drop):
-        return timedelta(0)
-
-    prev_end_airport  = is_airport_place(prev_drop)
-    next_pick_airport = is_airport_place(next_pick)
-
-    if prev_end_airport and next_pick_airport:
-        return timedelta(minutes=int(gaps.get("A2A", 50)))
-    if prev_end_airport and not next_pick_airport:
-        return timedelta(minutes=int(gaps.get("A2C", 0)))
-    if (not prev_end_airport) and next_pick_airport:
-        return timedelta(minutes=int(gaps.get("C2A", 0)))
-    return timedelta(minutes=int(gaps.get("C2C", 0)))
+    t_prev = booking_type(prev_row)
+    t_next = booking_type(next_row)
+    mins = 0
+    if t_prev in gap_matrix and t_next in gap_matrix[t_prev]:
+        mins = int(gap_matrix[t_prev][t_next])
+    return timedelta(minutes=mins)
 
 def extract_busy_until(note: str):
     if not note: return None
@@ -239,7 +264,6 @@ def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: tim
         req_start = r.get("start")
         req_end = r.get("end")
         if req_start is None or req_end is None:
-            # treat as all-day if missing (anchor to today purely for ordering; allocator uses real service_date later)
             today = date.today()
             req_start = datetime.combine(today, datetime.strptime("00:00","%H:%M").time())
             req_end   = datetime.combine(today, datetime.strptime("23:59","%H:%M").time())
@@ -258,7 +282,7 @@ def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: tim
         best_car = None
         best_earliest_start = None
         for car in candidates:
-            earliest_start = max(req_start, car_free_at[car] + handover)  # must respect handover before next driver
+            earliest_start = max(req_start, car_free_at[car] + handover)
             if best_car is None or earliest_start < best_earliest_start:
                 best_car = car
                 best_earliest_start = earliest_start
@@ -266,7 +290,6 @@ def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: tim
         roster[name] = best_car
         eff_start = best_earliest_start
         windows[name] = (eff_start, req_end)
-        # After this driver, the car becomes free at their end (handover applied when next driver is chosen)
         car_free_at[best_car] = req_end
 
     return roster, windows
@@ -323,7 +346,8 @@ def assign_plan_with_rostered_cars(
     late_allow: int,
     auto_relax_to_soft: bool,
     respect_dates: bool,
-    gap_matrix: dict
+    gap_matrix: dict,
+    gap_cph_only: bool
 ):
     """
     - Build a car roster (one car per driver for whole shift; shifts may be pushed by car availability + handover)
@@ -331,13 +355,12 @@ def assign_plan_with_rostered_cars(
         * driver effective shift window (with soft/hard early & late allow)
         * driver's rostered car only
         * far-away rides require FAR_CAR_ID (e.g., 209)
-        * ride busy time + CPH airport/city **custom gap** rules (between jobs for the same driver)
+        * ride busy time + **type-to-type gap matrix** (prev route type ➜ next route type)
     - Balancing:
-        * We iterate drivers in a rotating order (round-robin start index)
-        * Among feasible drivers for a job, pick the one with the **fewest assigned jobs**
-          (ties broken by smallest idle time before pickup). If only one driver fits, they get it.
+        * Iterate drivers in rotating order
+        * Among feasible drivers, pick the one with the FEWEST assigned jobs, then smallest idle time
     """
-    # Safety: drop cancelled / no-show rows if the caller forgot to filter
+    # Safety: drop cancelled / no-show rows
     rides = rides_df.copy()
     try:
         rides = rides[~rides.apply(row_is_cancelled, axis=1)].copy()
@@ -377,7 +400,7 @@ def assign_plan_with_rostered_cars(
     # Build roster
     roster, effective_windows = build_car_roster(driver_rows, active_cars, handover=car_handover)
 
-    # Per-driver state for job chaining
+    # Per-driver state
     states = {}
     for _, r in driver_rows.iterrows():
         name = r["name"]
@@ -392,7 +415,7 @@ def assign_plan_with_rostered_cars(
             "eff_start": eff_start,
             "eff_end": eff_end,
             "last_row": None,
-            "count": 0,  # for balancing
+            "count": 0,
         }
 
     if not states:
@@ -405,7 +428,7 @@ def assign_plan_with_rostered_cars(
 
     # assign jobs
     driver_names = list(states.keys())
-    d_rr = 0  # rotating start index for fairness
+    d_rr = 0  # rotating start index
     for i, row in rides.iterrows():
         pickup_dt = row["Pickup Time"]
         busy_td = busy_block_for_row(row)
@@ -415,7 +438,7 @@ def assign_plan_with_rostered_cars(
         hard_needed = {}
         available_at_map = {}
 
-        # rotate the start of the driver list each job
+        # rotate start
         for _ in range(len(driver_names)):
             name = driver_names[d_rr]
             d_rr = (d_rr + 1) % len(driver_names)
@@ -429,7 +452,7 @@ def assign_plan_with_rostered_cars(
                 if FAR_CAR_ID not in active_cars:
                     continue
 
-            # shift window with flex (use effective window from roster)
+            # shift window with flex
             st_dt = states[name]["eff_start"]
             en_dt = states[name]["eff_end"]
             flex = in_flex_window(pickup_dt, st_dt, en_dt, soft_early, hard_early, late_allow)
@@ -443,19 +466,19 @@ def assign_plan_with_rostered_cars(
                 else:
                     continue
 
-            # chain against last job (gap rules)
+            # chain against last job (type-to-type gap)
             last_row = states[name]["last_row"]
             if last_row is not None:
                 prev_pickup = pd.to_datetime(last_row["Pickup Time"])
                 prev_busy = busy_block_for_row(last_row)
                 prev_finish = prev_pickup + prev_busy
-                extra_gap = rule_gap_after(last_row, row, gap_matrix)
+                extra_gap = rule_gap_after(last_row, row, gap_matrix, gap_cph_only)
                 earliest_next = prev_finish + extra_gap
                 if pickup_dt < earliest_next:
                     continue
                 available_at_map[name] = earliest_next
             else:
-                available_at_map[name] = st_dt  # earliest they can start
+                available_at_map[name] = st_dt
 
             feasible.append(name)
             hard_needed[name] = (flex == "hard")
@@ -464,13 +487,11 @@ def assign_plan_with_rostered_cars(
             rides.at[i, "Notes"] = ("No " + FAR_CAR_ID + " driver free (window/gap)") if far_req else "No driver free (window/gap)"
             continue
 
-        # Balanced selection:
-        # 1) fewest assigned jobs
-        # 2) then smallest idle time before pickup (pickup - available_at)
+        # Balanced selection: fewest jobs, then smallest idle time
         def _key(nm):
             idle = (pickup_dt - available_at_map[nm]).total_seconds()
             if idle < 0:
-                idle = float('inf')  # safety, shouldn't happen due to feasibility
+                idle = float('inf')
             return (states[nm]["count"], idle)
 
         chosen = min(feasible, key=_key)
@@ -599,7 +620,6 @@ if rides_file:
     for i, name in enumerate(selected_names_live):
         with cols[i % 2]:
             st.markdown(f"**{name}**")
-            # Per-driver dates default to service_date but can be changed
             start_date = st.date_input(f"{name} start date", value=service_date, key=f"sd_{name}")
             start_time = st.time_input(f"{name} start time", value=None, key=f"st_{name}")
             end_date   = st.date_input(f"{name} end date", value=service_date, key=f"ed_{name}")
@@ -619,18 +639,24 @@ if rides_file:
         late_min = st.slider("Late end allowed (min)", 0, 120, 20, 5)
         auto_relax = st.checkbox("If a job is unassigned for window only, auto-relax to SOFT", value=True)
 
-    # NEW: CPH gap matrix (custom minutes)
-    with st.expander("CPH gap rules between bookings (minutes)"):
-        c1, c2 = st.columns(2)
-        with c1:
-            # Defaults aligned with your example: after City→Airport
-            # the next Airport→City (A2A) needs 0, while Airport→pickup in City (A2C) needs 40
-            gap_a2a = st.number_input("Airport ➜ Airport", 0, 240, 0, 5)   # prev end at airport -> next pickup at airport
-            gap_a2c = st.number_input("Airport ➜ City",    0, 240, 40, 5)  # prev end at airport -> next pickup in city
-        with c2:
-            gap_c2a = st.number_input("City ➜ Airport",    0, 240, 0, 5)
-            gap_c2c = st.number_input("City ➜ City",       0, 240, 0, 5)
-        gap_matrix = {"A2A": int(gap_a2a), "A2C": int(gap_a2c), "C2A": int(gap_c2a), "C2C": int(gap_c2c)}
+    # TYPE➜TYPE gap matrix (4×4)
+    with st.expander("Gap rules between booking TYPES (prev ➜ next)"):
+        st.caption("Types: C2A (City→Airport), A2C (Airport→City), A2A (Airport→Airport), C2C (City→City)")
+        gap_cph_only = st.checkbox("Apply gaps only when both pickups are in the CPH area", value=False)
+
+        types = ["C2A","A2C","A2A","C2C"]
+        defaults = {
+            ("C2A","C2A"): 40,  # your “city to city” meaning City→Airport then City→Airport
+            ("C2A","A2C"): 0,   # City→Airport then Airport→City
+        }
+
+        gap_matrix = {}
+        for r in types:
+            gap_matrix[r] = {}
+            row_cols = st.columns(len(types))
+            for j, c in enumerate(types):
+                default_val = defaults.get((r, c), 0)
+                gap_matrix[r][c] = row_cols[j].number_input(f"{r} ➜ {c}", 0, 240, default_val, 5, key=f"gap_{r}_{c}")
 
     col_run, col_clear = st.columns(2)
     with col_run:
@@ -647,6 +673,7 @@ if rides_file:
                 "late_allow": int(late_min),
                 "auto_relax": bool(auto_relax),
                 "gap_matrix": gap_matrix,
+                "gap_cph_only": bool(gap_cph_only),
             }
             st.session_state.run_plan = True
     with col_clear:
@@ -668,36 +695,30 @@ if rides_file:
                 late_allow=s["late_allow"],
                 auto_relax_to_soft=s["auto_relax"],
                 respect_dates=s["respect_dates"],
-                gap_matrix=s["gap_matrix"]
+                gap_matrix=s["gap_matrix"],
+                gap_cph_only=s["gap_cph_only"]
             )
         except Exception as e:
             st.error(f"Planning failed: {e}")
             st.stop()
 
-        # Map columns EXACTLY as you asked:
-        # Pickup := "Pick Up"
-        # Dropoff := "Drop off"
-        ensure_column(plan_df, "Pickup", ["Pick Up","Pick up","Pickup","Pickup Address","From","Start","Start Address","PickupLocation","Pickup Loc"])
-        ensure_column(plan_df, "Dropoff", ["Drop off","Dropoff","Dropoff Address","To","End","End Address","DropoffLocation","Dropoff Loc"])
-
-        # Name := "Pax Name"
+        # Normalize columns for display/exports
+        ensure_column(plan_df, "Pickup", PICKUP_CANDIDATES)
+        ensure_column(plan_df, "Dropoff", DROPOFF_CANDIDATES)
         ensure_column(plan_df, "Name", ["Pax Name","Passenger Name","PAX","Pax","Client Name","Customer Name"])
 
-        # Pretty table (whole day) with Booking ID from Ref No, Name, Pickup & Dropoff
         plan_df.rename(columns={"Assigned Driver":"Allocated Driver", "Car":"Allocated Car"}, inplace=True)
 
-        # Ensure columns used below exist
         for c in ["Pickup Time","Pickup","Dropoff","Allocated Driver","Allocated Car","Notes","Ref No","Ride ID","Booking ID","Name"]:
             if c not in plan_df.columns:
                 plan_df[c] = ""
 
-        # Derive Booking ID from Ref No (fallbacks included)
         plan_df["Booking ID"] = plan_df.apply(get_booking_id, axis=1)
 
         display_cols = [
             "Pickup Time",
-            "Booking ID",   # from Ref No
-            "Name",         # from Pax Name
+            "Booking ID",
+            "Name",
             "Pickup",
             "Dropoff",
             "Allocated Driver",
@@ -718,9 +739,8 @@ if rides_file:
             mime="text/csv"
         )
 
-        # Show roster summary (safe formatting)
+        # Roster summary
         st.subheader("Car Roster (one car per driver)")
-
         def _fmt_dt(dt):
             try:
                 if isinstance(dt, pd.Timestamp):
@@ -732,12 +752,7 @@ if rides_file:
         roster_rows = []
         for name, car in roster.items():
             st_dt, en_dt = eff_windows.get(name, (None, None))
-            roster_rows.append({
-                "Driver": name,
-                "Car": car or "",
-                "From": _fmt_dt(st_dt),
-                "To": _fmt_dt(en_dt),
-            })
+            roster_rows.append({"Driver": name, "Car": car or "", "From": _fmt_dt(st_dt), "To": _fmt_dt(en_dt)})
 
         roster_df = pd.DataFrame(roster_rows)
         if not roster_df.empty:
