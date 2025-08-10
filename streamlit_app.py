@@ -60,9 +60,13 @@ def load_drivers():
 def _norm(s: str) -> str:
     return (s or "").strip().lower()
 
-def is_airport_pickup(pickup_text: str) -> bool:
-    s = _norm(pickup_text)
+def is_airport_place(text: str) -> bool:
+    s = _norm(text)
     return any(k in s for k in AIRPORT_KW)
+
+# kept for backward compatibility
+def is_airport_pickup(pickup_text: str) -> bool:
+    return is_airport_place(pickup_text)
 
 def is_copenhagen(text_a: str, text_b: str) -> bool:
     s1, s2 = _norm(text_a), _norm(text_b)
@@ -132,7 +136,7 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
 
     # Far-away rule
     if distance_km is not None and distance_km >= FAR_DISTANCE_KM:
-        extra = 30 if is_airport_pickup(pickup_txt) else 0
+        extra = 30 if is_airport_place(pickup_txt) else 0
         return timedelta(minutes=trip_min + extra)
 
     return timedelta(minutes=trip_min)
@@ -140,25 +144,34 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
 def rule_gap_after(prev_row: pd.Series, next_row: pd.Series, gaps: dict) -> timedelta:
     """
     Extra gap *between* bookings on top of the previous job's busy time.
-    Copenhagen-only (if both legs are in CPH area).
-    gaps dict keys: 'A2A','A2C','C2A','C2C'  (minutes)
+
+    Logic keys off where the previous job ENDED (prev dropoff) and where the NEXT job
+    STARTS (next pickup):
+
+        A2A: prev ended at Airport  -> next pickup at Airport
+        A2C: prev ended at Airport  -> next pickup in City
+        C2A: prev ended in City     -> next pickup at Airport
+        C2C: prev ended in City     -> next pickup in City
+
+    Copenhagen-only (both legs must be in CPH area for the rule to apply).
     """
     prev_pick = str(prev_row.get("Pickup", "") or "")
     prev_drop = str(prev_row.get("Dropoff", "") or "")
     next_pick = str(next_row.get("Pickup", "") or "")
     next_drop = str(next_row.get("Dropoff", "") or "")
 
+    # only apply these micro-gaps for CPH-area legs
     if not is_copenhagen(prev_pick, prev_drop) or not is_copenhagen(next_pick, next_drop):
         return timedelta(0)
 
-    prev_is_airport = is_airport_pickup(prev_pick)
-    next_is_airport = is_airport_pickup(next_pick)
+    prev_end_airport  = is_airport_place(prev_drop)
+    next_pick_airport = is_airport_place(next_pick)
 
-    if prev_is_airport and next_is_airport:
+    if prev_end_airport and next_pick_airport:
         return timedelta(minutes=int(gaps.get("A2A", 50)))
-    if prev_is_airport and not next_is_airport:
+    if prev_end_airport and not next_pick_airport:
         return timedelta(minutes=int(gaps.get("A2C", 0)))
-    if (not prev_is_airport) and next_is_airport:
+    if (not prev_end_airport) and next_pick_airport:
         return timedelta(minutes=int(gaps.get("C2A", 0)))
     return timedelta(minutes=int(gaps.get("C2C", 0)))
 
@@ -297,7 +310,7 @@ def build_bilplan(plan_df: pd.DataFrame, service_date: date) -> str:
     return "\n".join(lines)
 
 # =========================
-# Assignment (uses roster + far-away->209 rule)
+# Assignment (uses roster + far-away->209 rule) + balanced selection
 # =========================
 def assign_plan_with_rostered_cars(
     rides_df: pd.DataFrame,
@@ -319,6 +332,10 @@ def assign_plan_with_rostered_cars(
         * driver's rostered car only
         * far-away rides require FAR_CAR_ID (e.g., 209)
         * ride busy time + CPH airport/city **custom gap** rules (between jobs for the same driver)
+    - Balancing:
+        * We iterate drivers in a rotating order (round-robin start index)
+        * Among feasible drivers for a job, pick the one with the **fewest assigned jobs**
+          (ties broken by smallest idle time before pickup). If only one driver fits, they get it.
     """
     # Safety: drop cancelled / no-show rows if the caller forgot to filter
     rides = rides_df.copy()
@@ -375,7 +392,11 @@ def assign_plan_with_rostered_cars(
             "eff_start": eff_start,
             "eff_end": eff_end,
             "last_row": None,
+            "count": 0,  # for balancing
         }
+
+    if not states:
+        return rides, roster, effective_windows
 
     # Hint if far-away rides exist but FAR_CAR_ID isn't active
     has_far = any(is_far_away_row(r) for _, r in rides.iterrows())
@@ -384,7 +405,7 @@ def assign_plan_with_rostered_cars(
 
     # assign jobs
     driver_names = list(states.keys())
-    d_rr = 0
+    d_rr = 0  # rotating start index for fairness
     for i, row in rides.iterrows():
         pickup_dt = row["Pickup Time"]
         busy_td = busy_block_for_row(row)
@@ -392,6 +413,9 @@ def assign_plan_with_rostered_cars(
 
         feasible = []
         hard_needed = {}
+        available_at_map = {}
+
+        # rotate the start of the driver list each job
         for _ in range(len(driver_names)):
             name = driver_names[d_rr]
             d_rr = (d_rr + 1) % len(driver_names)
@@ -429,6 +453,9 @@ def assign_plan_with_rostered_cars(
                 earliest_next = prev_finish + extra_gap
                 if pickup_dt < earliest_next:
                     continue
+                available_at_map[name] = earliest_next
+            else:
+                available_at_map[name] = st_dt  # earliest they can start
 
             feasible.append(name)
             hard_needed[name] = (flex == "hard")
@@ -437,12 +464,22 @@ def assign_plan_with_rostered_cars(
             rides.at[i, "Notes"] = ("No " + FAR_CAR_ID + " driver free (window/gap)") if far_req else "No driver free (window/gap)"
             continue
 
-        chosen = feasible[0]
+        # Balanced selection:
+        # 1) fewest assigned jobs
+        # 2) then smallest idle time before pickup (pickup - available_at)
+        def _key(nm):
+            idle = (pickup_dt - available_at_map[nm]).total_seconds()
+            if idle < 0:
+                idle = float('inf')  # safety, shouldn't happen due to feasibility
+            return (states[nm]["count"], idle)
+
+        chosen = min(feasible, key=_key)
         chosen_hard = hard_needed[chosen]
         chosen_car = states[chosen]["car"]
 
         # lock assignment
         states[chosen]["last_row"] = row.copy()
+        states[chosen]["count"] += 1
         busy_until = pickup_dt + busy_td
 
         note = f"Busy until {busy_until.strftime('%H:%M')}"
@@ -586,8 +623,10 @@ if rides_file:
     with st.expander("CPH gap rules between bookings (minutes)"):
         c1, c2 = st.columns(2)
         with c1:
-            gap_a2a = st.number_input("Airport ➜ Airport", 0, 240, 50, 5)
-            gap_a2c = st.number_input("Airport ➜ City",    0, 240, 50, 5)
+            # Defaults aligned with your example: after City→Airport
+            # the next Airport→City (A2A) needs 0, while Airport→pickup in City (A2C) needs 40
+            gap_a2a = st.number_input("Airport ➜ Airport", 0, 240, 0, 5)   # prev end at airport -> next pickup at airport
+            gap_a2c = st.number_input("Airport ➜ City",    0, 240, 40, 5)  # prev end at airport -> next pickup in city
         with c2:
             gap_c2a = st.number_input("City ➜ Airport",    0, 240, 0, 5)
             gap_c2c = st.number_input("City ➜ City",       0, 240, 0, 5)
