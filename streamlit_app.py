@@ -36,7 +36,14 @@ CAR_POOL = [
     "S-klasse","525","979","516","225"
 ]
 
-AIRPORT_KW = {"cph", "cph airport", "copenhagen airport", "kastrup", "københavn lufthavn", "kastrup lufthavn"}
+# Airport detection:
+# - removed: "terminal", "kastrup"
+# - added: "lufthavn", "københavns lufthavn", and ANY text containing "lufthavn"
+AIRPORT_KW = {
+    "cph", "cph airport", "copenhagen airport",
+    "københavns lufthavn", "lufthavn"
+}
+# CPH area keywords (ok to keep "kastrup" here as a district/city indicator)
 CPH_KW = {"copenhagen", "københavn", "cph", "kastrup", "frederiksberg"}
 
 FAR_DISTANCE_KM = 45.0
@@ -46,9 +53,9 @@ FAR_CAR_ID = "209"
 PICKUP_CANDIDATES  = ["Pickup","Pick Up","Pick up","Pickup Address","From","Start","Start Address","PickupLocation","Pickup Loc"]
 DROPOFF_CANDIDATES = ["Dropoff","Drop off","Dropoff Address","To","End","End Address","DropoffLocation","Dropoff Loc"]
 
-def _get_first_present(row: pd.Series, candidates) -> str:
+def _first_present(row: pd.Series, candidates) -> str:
     for c in candidates:
-        if c in row and str(row[c]).strip() != "":
+        if c in row and str(row[c]).strip():
             return str(row[c])
     return ""
 
@@ -71,15 +78,22 @@ def _norm(s: str) -> str:
     return (s or "").strip().lower()
 
 def is_airport_place(text: str) -> bool:
+    """
+    Airport if:
+      - contains 'lufthavn' anywhere, OR
+      - matches any AIRPORT_KW token (which already includes 'lufthavn' and 'københavns lufthavn')
+    """
     s = _norm(text)
+    if "lufthavn" in s:
+        return True
     return any(k in s for k in AIRPORT_KW)
 
 # kept for backward compatibility in other helpers
 def is_airport_pickup(pickup_text: str) -> bool:
     return is_airport_place(pickup_text)
 
-def is_copenhagen(text_a: str, text_b: str) -> bool:
-    s1, s2 = _norm(text_a), _norm(text_b)
+def is_copenhagen(a: str, b: str) -> bool:
+    s1, s2 = _norm(a), _norm(b)
     return any(k in s1 for k in CPH_KW) or any(k in s2 for k in CPH_KW)
 
 def parse_minutes(value):
@@ -116,30 +130,29 @@ def is_far_away_row(row: pd.Series) -> bool:
     return (dk is not None) and (dk >= FAR_DISTANCE_KM)
 
 def get_pickup_text(row: pd.Series) -> str:
-    return _get_first_present(row, PICKUP_CANDIDATES)
+    return _first_present(row, PICKUP_CANDIDATES)
 
 def get_dropoff_text(row: pd.Series) -> str:
-    return _get_first_present(row, DROPOFF_CANDIDATES)
+    return _first_present(row, DROPOFF_CANDIDATES)
 
 # -------- Route type (restricted to 3 types) --------
 def booking_type(row: pd.Series) -> str:
     """
-    Classify booking into one of exactly 3 route types:
-      C2C: City -> City
-      A2C: Airport -> City
-      C2A: City -> Airport
-
-    If a rare Airport->Airport appears, we map it to A2C so the matrix remains 3x3.
+    Exactly three types:
+      C2C = City -> City
+      A2C = Airport -> City
+      C2A = City -> Airport
+    Any Airport->Airport (if it appears) is normalized to A2C for your ops.
     """
     pick = get_pickup_text(row)
     drop = get_dropoff_text(row)
     pick_air = is_airport_place(pick)
     drop_air = is_airport_place(drop)
     if pick_air and drop_air:
-        return "A2C"  # normalize A->A into A2C bucket (no true A2A flow in your ops)
+        return "A2C"  # normalize A->A into A2C bucket
     if pick_air and not drop_air:
         return "A2C"
-    if not pick_air and drop_air:
+    if (not pick_air) and drop_air:
         return "C2A"
     return "C2C"
 
@@ -179,7 +192,7 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
 
 def rule_gap_after(prev_row: pd.Series, next_row: pd.Series, gap_matrix: dict, cph_only: bool) -> timedelta:
     """
-    Extra gap *between* bookings on top of the previous job's busy time.
+    Extra gap on top of the previous job's busy time.
 
     Gaps are prev_route_type ➜ next_route_type in a 3×3:
       Types: C2C, A2C, C2A
@@ -331,7 +344,7 @@ def build_bilplan(plan_df: pd.DataFrame, service_date: date) -> str:
     return "\n".join(lines)
 
 # =========================
-# Assignment (uses roster + far-away->209 rule) + balanced selection
+# Assignment (roster + far-away->209) + balancing + 3x3 gaps
 # =========================
 def assign_plan_with_rostered_cars(
     rides_df: pd.DataFrame,
@@ -348,7 +361,7 @@ def assign_plan_with_rostered_cars(
     gap_cph_only: bool
 ):
     """
-    - Build a car roster (one car per driver for whole shift; shifts may be pushed by car availability + handover)
+    - Build car roster (one car per driver for whole shift; shifts may be pushed by car availability + handover)
     - Assign rides respecting:
         * driver effective shift window (with soft/hard early & late allow)
         * driver's rostered car only
