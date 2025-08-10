@@ -74,7 +74,7 @@ def is_airport_place(text: str) -> bool:
     s = _norm(text)
     return any(k in s for k in AIRPORT_KW)
 
-# kept for backward compatibility
+# kept for backward compatibility in other helpers
 def is_airport_pickup(pickup_text: str) -> bool:
     return is_airport_place(pickup_text)
 
@@ -121,20 +121,22 @@ def get_pickup_text(row: pd.Series) -> str:
 def get_dropoff_text(row: pd.Series) -> str:
     return _get_first_present(row, DROPOFF_CANDIDATES)
 
+# -------- Route type (restricted to 3 types) --------
 def booking_type(row: pd.Series) -> str:
     """
-    Classify a single booking into route type:
-      C2A: City -> Airport
-      A2C: Airport -> City
-      A2A: Airport -> Airport
+    Classify booking into one of exactly 3 route types:
       C2C: City -> City
+      A2C: Airport -> City
+      C2A: City -> Airport
+
+    If a rare Airport->Airport appears, we map it to A2C so the matrix remains 3x3.
     """
     pick = get_pickup_text(row)
     drop = get_dropoff_text(row)
     pick_air = is_airport_place(pick)
     drop_air = is_airport_place(drop)
     if pick_air and drop_air:
-        return "A2A"
+        return "A2C"  # normalize A->A into A2C bucket (no true A2A flow in your ops)
     if pick_air and not drop_air:
         return "A2C"
     if not pick_air and drop_air:
@@ -147,8 +149,6 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
       - Roadshow / Site Inspection: Duration Minutes/Hours if given; else Trip + 60.
       - Far-away: km >= FAR_DISTANCE_KM => Trip + (30 if pickup is airport else 0).
       - Else: Trip (or 30 fallback).
-    Uses:
-      Trip Minutes, *distance variants*, Pickup, Customer Name, Type, Duration Minutes, Duration Hours
     """
     trip_min = parse_minutes(row.get("Trip Minutes")) or 30
 
@@ -181,11 +181,10 @@ def rule_gap_after(prev_row: pd.Series, next_row: pd.Series, gap_matrix: dict, c
     """
     Extra gap *between* bookings on top of the previous job's busy time.
 
-    Gaps are defined by **route type of previous booking ➜ route type of next booking**:
-      Types: C2A, A2C, A2A, C2C
-      Example: gap_matrix["C2A"]["C2A"] = 40  (after a City→Airport, the next City→Airport needs 40 min)
+    Gaps are prev_route_type ➜ next_route_type in a 3×3:
+      Types: C2C, A2C, C2A
 
-    If cph_only is True, apply these gaps only when both *pickups* are in the CPH area.
+    If cph_only=True, apply only when both pickups are within the CPH area.
     """
     if cph_only:
         prev_pick = get_pickup_text(prev_row)
@@ -195,9 +194,8 @@ def rule_gap_after(prev_row: pd.Series, next_row: pd.Series, gap_matrix: dict, c
 
     t_prev = booking_type(prev_row)
     t_next = booking_type(next_row)
-    mins = 0
-    if t_prev in gap_matrix and t_next in gap_matrix[t_prev]:
-        mins = int(gap_matrix[t_prev][t_next])
+
+    mins = int(gap_matrix.get(t_prev, {}).get(t_next, 0))
     return timedelta(minutes=mins)
 
 def extract_busy_until(note: str):
@@ -282,7 +280,7 @@ def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: tim
         best_car = None
         best_earliest_start = None
         for car in candidates:
-            earliest_start = max(req_start, car_free_at[car] + handover)
+            earliest_start = max(req_start, car_free_at[car] + handover)  # respect handover
             if best_car is None or earliest_start < best_earliest_start:
                 best_car = car
                 best_earliest_start = earliest_start
@@ -358,9 +356,8 @@ def assign_plan_with_rostered_cars(
         * ride busy time + **type-to-type gap matrix** (prev route type ➜ next route type)
     - Balancing:
         * Iterate drivers in rotating order
-        * Among feasible drivers, pick the one with the FEWEST assigned jobs, then smallest idle time
+        * Among feasible drivers, pick FEWEST jobs, then smallest idle time
     """
-    # Safety: drop cancelled / no-show rows
     rides = rides_df.copy()
     try:
         rides = rides[~rides.apply(row_is_cancelled, axis=1)].copy()
@@ -438,7 +435,7 @@ def assign_plan_with_rostered_cars(
         hard_needed = {}
         available_at_map = {}
 
-        # rotate start
+        # rotate start for fairness
         for _ in range(len(driver_names)):
             name = driver_names[d_rr]
             d_rr = (d_rr + 1) % len(driver_names)
@@ -639,15 +636,19 @@ if rides_file:
         late_min = st.slider("Late end allowed (min)", 0, 120, 20, 5)
         auto_relax = st.checkbox("If a job is unassigned for window only, auto-relax to SOFT", value=True)
 
-    # TYPE➜TYPE gap matrix (4×4)
+    # 3×3 TYPE➜TYPE gap matrix (C2C, A2C, C2A)
     with st.expander("Gap rules between booking TYPES (prev ➜ next)"):
-        st.caption("Types: C2A (City→Airport), A2C (Airport→City), A2A (Airport→Airport), C2C (City→City)")
+        st.caption("Types: C2C (City→City), A2C (Airport→City), C2A (City→Airport)")
         gap_cph_only = st.checkbox("Apply gaps only when both pickups are in the CPH area", value=False)
 
-        types = ["C2A","A2C","A2A","C2C"]
+        types = ["C2C","A2C","C2A"]
+        # sensible defaults for your example:
+        # after C2A (City→Airport):
+        #   next A2C (Airport→City) = 0
+        #   next C2A (City→Airport) = 40
         defaults = {
-            ("C2A","C2A"): 40,  # your “city to city” meaning City→Airport then City→Airport
-            ("C2A","A2C"): 0,   # City→Airport then Airport→City
+            ("C2A","A2C"): 0,
+            ("C2A","C2A"): 40,
         }
 
         gap_matrix = {}
