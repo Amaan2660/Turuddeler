@@ -38,20 +38,27 @@ CAR_POOL = [
 
 # Airport detection:
 # - removed: "terminal", "kastrup"
-# - added: "lufthavn", "københavns lufthavn", and ANY text containing "lufthavn"
+# - added: "lufthavn" catch-all, "københavns lufthavn", and standard CPH names
 AIRPORT_KW = {
     "cph", "cph airport", "copenhagen airport",
     "københavns lufthavn", "lufthavn"
 }
-# CPH area keywords (ok to keep "kastrup" here as a district/city indicator)
+# CPH area keywords (we keep "kastrup" here as a district/city indicator, not airport)
 CPH_KW = {"copenhagen", "københavn", "cph", "kastrup", "frederiksberg"}
 
 FAR_DISTANCE_KM = 45.0
 FAR_CAR_ID = "209"
 
-# Column candidates (so logic works before we normalize headers)
-PICKUP_CANDIDATES  = ["Pickup","Pick Up","Pick up","Pickup Address","From","Start","Start Address","PickupLocation","Pickup Loc"]
-DROPOFF_CANDIDATES = ["Dropoff","Drop off","Dropoff Address","To","End","End Address","DropoffLocation","Dropoff Loc"]
+# Column candidates (ensure we look at the real "Drop Off" column!)
+PICKUP_CANDIDATES  = [
+    "Pickup","Pick Up","Pick up","Pickup Address","From","Start",
+    "Start Address","PickupLocation","Pickup Loc","Pick Up Address"
+]
+DROPOFF_CANDIDATES = [
+    "Drop Off",           # <-- exact column you said carries the destination
+    "Dropoff","Drop off","Dropoff Address","To","End",
+    "End Address","DropoffLocation","Dropoff Loc","Drop Off Address"
+]
 
 def _first_present(row: pd.Series, candidates) -> str:
     for c in candidates:
@@ -81,14 +88,14 @@ def is_airport_place(text: str) -> bool:
     """
     Airport if:
       - contains 'lufthavn' anywhere, OR
-      - matches any AIRPORT_KW token (which already includes 'lufthavn' and 'københavns lufthavn')
+      - matches any AIRPORT_KW token (includes 'københavns lufthavn', 'cph', etc.)
     """
     s = _norm(text)
     if "lufthavn" in s:
         return True
     return any(k in s for k in AIRPORT_KW)
 
-# kept for backward compatibility in other helpers
+# kept for backward compatibility
 def is_airport_pickup(pickup_text: str) -> bool:
     return is_airport_place(pickup_text)
 
@@ -207,7 +214,6 @@ def rule_gap_after(prev_row: pd.Series, next_row: pd.Series, gap_matrix: dict, c
 
     t_prev = booking_type(prev_row)
     t_next = booking_type(next_row)
-
     mins = int(gap_matrix.get(t_prev, {}).get(t_next, 0))
     return timedelta(minutes=mins)
 
@@ -655,10 +661,7 @@ if rides_file:
         gap_cph_only = st.checkbox("Apply gaps only when both pickups are in the CPH area", value=False)
 
         types = ["C2C","A2C","C2A"]
-        # sensible defaults for your example:
-        # after C2A (City→Airport):
-        #   next A2C (Airport→City) = 0
-        #   next C2A (City→Airport) = 40
+        # you can prefill some defaults here if you like
         defaults = {
             ("C2A","A2C"): 0,
             ("C2A","C2A"): 40,
@@ -716,9 +719,9 @@ if rides_file:
             st.error(f"Planning failed: {e}")
             st.stop()
 
-        # Normalize columns for display/exports
+        # Normalize columns for display/exports (include exact "Drop Off")
         ensure_column(plan_df, "Pickup", PICKUP_CANDIDATES)
-        ensure_column(plan_df, "Dropoff", DROPOFF_CANDIDATES)
+        ensure_column(plan_df, "Dropoff", DROPOFF_CANDIDATES)  # this ensures we show the real Drop Off in the UI
         ensure_column(plan_df, "Name", ["Pax Name","Passenger Name","PAX","Pax","Client Name","Customer Name"])
 
         plan_df.rename(columns={"Assigned Driver":"Allocated Driver", "Car":"Allocated Car"}, inplace=True)
