@@ -42,7 +42,7 @@ AIRPORT_KW = {
     "cph", "cph airport", "copenhagen airport",
     "københavns lufthavn", "lufthavn"
 }
-# CPH area keywords (ok to keep "kastrup" here as a district/city indicator)
+# CPH area keywords (we keep "kastrup" here as a district/city indicator)
 CPH_KW = {"copenhagen", "københavn", "cph", "kastrup", "frederiksberg"}
 
 FAR_DISTANCE_KM = 45.0
@@ -54,7 +54,7 @@ PICKUP_CANDIDATES  = [
     "Start Address","PickupLocation","Pickup Loc","Pick Up Address"
 ]
 DROPOFF_CANDIDATES = [
-    "Drop Off",  # exact column you pointed to
+    "Drop Off",  # exact column we should prefer
     "Dropoff","Drop off","Dropoff Address","To","End",
     "End Address","DropoffLocation","Dropoff Loc","Drop Off Address"
 ]
@@ -345,7 +345,7 @@ def build_bilplan(plan_df: pd.DataFrame, service_date: date) -> str:
     return "\n".join(lines)
 
 # =========================
-# Assignment (roster + far-away->209) + balancing + gaps
+# Assignment (active list + round-robin cursor + gaps)
 # =========================
 def assign_plan_with_rostered_cars(
     rides_df: pd.DataFrame,
@@ -363,18 +363,19 @@ def assign_plan_with_rostered_cars(
     use_gap_only: bool
 ):
     """
-    - Roster cars (one per driver for full shift).
-    - Assign rides respecting shift windows, rostered car, far-away rules.
-    - Chain with **type→type gap**; if use_gap_only=True, the GAP ALONE controls spacing (ignoring Trip Minutes).
-    - Balance: fewest jobs, then smallest idle time.
+    Live round-robin:
+      - Maintain an ACTIVE list based on shift start/end.
+      - For each ride, scan ACTIVE starting at cursor, wrap around.
+      - Choose among feasible by lowest load-per-hour; tie: closest ahead of cursor.
+      - Advance cursor ONLY when someone is assigned. Never drop someone for being infeasible.
     """
+    # 1) Preprocess rides
     rides = rides_df.copy()
     try:
         rides = rides[~rides.apply(row_is_cancelled, axis=1)].copy()
     except Exception:
         pass
 
-    # parse / anchor pickup times
     if "Pickup Time" not in rides.columns:
         raise ValueError("CSV must include 'Pickup Time' column.")
     rides["Pickup Time"] = pd.to_datetime(rides["Pickup Time"], errors="coerce")
@@ -399,71 +400,116 @@ def assign_plan_with_rostered_cars(
 
     rides = rides.sort_values("Pickup Time").reset_index(drop=True)
 
-    # outputs
+    # 2) Outputs
     rides["Assigned Driver"] = ""
     rides["Car"] = ""
     rides["Notes"] = ""
 
-    # Build roster
+    # 3) Build roster + driver states
     roster, effective_windows = build_car_roster(driver_rows, active_cars, handover=car_handover)
 
-    # Per-driver state
     states = {}
-    for _, r in driver_rows.iterrows():
+    base_order = []
+    for _, r in driver_rows.iterrows():  # preserve UI order
         name = r["name"]
         car = roster.get(name, (r.get("preferred_car") or "").strip())
         if not car:
             continue
-        eff_start, eff_end = effective_windows[name]
-        if eff_end <= eff_start:
-            eff_end = eff_end + timedelta(days=1)
+        st_dt, en_dt = effective_windows[name]
+        if en_dt <= st_dt:
+            en_dt = en_dt + timedelta(days=1)
+        shift_hours = max((en_dt - st_dt).total_seconds() / 3600.0, 0.01)  # avoid div/zero
         states[name] = {
             "car": car,
-            "eff_start": eff_start,
-            "eff_end": eff_end,
+            "eff_start": st_dt,
+            "eff_end": en_dt,
             "last_row": None,
             "count": 0,
+            "shift_hours": shift_hours,
         }
+        base_order.append(name)
 
     if not states:
         return rides, roster, effective_windows
 
-    # Hint if far-away rides exist but FAR_CAR_ID isn't active
+    # 4) Active list + cursor
+    active = []          # names currently on shift
+    cursor = 0           # index into 'active' to start scanning
+    in_active = set()    # quick membership
+
+    def refresh_active(now_dt: datetime):
+        """Add started drivers, remove those whose shift ended. Keep cursor stable."""
+        nonlocal active, cursor, in_active
+        # Add newly on-shift (follow base_order for stable sequence)
+        for nm in base_order:
+            if nm in in_active:
+                continue
+            st_dt = states[nm]["eff_start"]
+            en_dt = states[nm]["eff_end"]
+            if st_dt <= now_dt < en_dt:
+                active.append(nm)
+                in_active.add(nm)
+                # do NOT change cursor
+
+        # Remove who ended before/at now
+        i = 0
+        while i < len(active):
+            nm = active[i]
+            en_dt = states[nm]["eff_end"]
+            if now_dt >= en_dt:
+                if i < cursor:
+                    cursor -= 1
+                in_active.remove(nm)
+                del active[i]
+                if len(active) == 0:
+                    cursor = 0
+                else:
+                    cursor %= len(active)
+                continue
+            i += 1
+
+        # Normalize cursor
+        if active:
+            cursor %= len(active)
+        else:
+            cursor = 0
+
+    # Far-away hint
     has_far = any(is_far_away_row(r) for _, r in rides.iterrows())
     if has_far and FAR_CAR_ID not in active_cars:
         st.warning(f"Far-away bookings detected but car {FAR_CAR_ID} is not active. Those jobs will not be assigned.")
 
-    # assign jobs
-    driver_names = list(states.keys())
-    d_rr = 0  # rotating start index
+    # 5) Assignment loop
     for i, row in rides.iterrows():
         pickup_dt = row["Pickup Time"]
         busy_td = busy_block_for_row(row)
         far_req = is_far_away_row(row)
 
+        # Maintain active roster for this pickup time
+        refresh_active(pickup_dt)
+
+        if not active:
+            rides.at[i, "Notes"] = "No driver free (no active shifts)"
+            continue
+
+        # Scan from cursor, wrap around; collect feasible
+        n = len(active)
+        order = [(cursor + k) % n for k in range(n)]
         feasible = []
-        hard_needed = {}
-        available_at_map = {}
-        applied_gap_map = {}
+        applied_gap_min_map = {}
         prev_type_map = {}
 
-        # rotate start for fairness
-        for _ in range(len(driver_names)):
-            name = driver_names[d_rr]
-            d_rr = (d_rr + 1) % len(driver_names)
+        for idx in order:
+            nm = active[idx]
+            car = states[nm]["car"]
 
-            car = states[name]["car"]
+            # far-away requires FAR_CAR_ID
+            if far_req and car != FAR_CAR_ID:
+                continue
 
-            # Enforce far-away->FAR_CAR_ID
-            if far_req:
-                if car != FAR_CAR_ID:
-                    continue
-                if FAR_CAR_ID not in active_cars:
-                    continue
-
-            # shift window with flex
-            st_dt = states[name]["eff_start"]
-            en_dt = states[name]["eff_end"]
+            # window flex (should be inside shift already, but keep check)
+            st_dt = states[nm]["eff_start"]
+            en_dt = states[nm]["eff_end"]
             flex = in_flex_window(pickup_dt, st_dt, en_dt, soft_early, hard_early, late_allow)
             if flex is None:
                 if auto_relax_to_soft:
@@ -471,71 +517,65 @@ def assign_plan_with_rostered_cars(
                     soft_end   = en_dt + timedelta(minutes=late_allow)
                     if not (soft_start <= pickup_dt <= soft_end):
                         continue
-                    flex = "soft"
+                    # treat as soft
                 else:
                     continue
 
-            # chain against last job (type-to-type gap)
-            last_row = states[name]["last_row"]
+            # chaining via type->type gap
+            last_row = states[nm]["last_row"]
             if last_row is not None:
                 extra_gap = rule_gap_after(last_row, row, gap_matrix, gap_cph_only)
-                prev_pickup = pd.to_datetime(last_row["Pickup Time"])
+                prev_pick = pd.to_datetime(last_row["Pickup Time"])
                 if use_gap_only:
-                    earliest_next = prev_pickup + extra_gap
+                    earliest_next = prev_pick + extra_gap
                 else:
                     prev_busy = busy_block_for_row(last_row)
-                    earliest_next = prev_pickup + prev_busy + extra_gap
+                    earliest_next = prev_pick + prev_busy + extra_gap
                 if pickup_dt < earliest_next:
                     continue
-                available_at_map[name] = earliest_next
-                applied_gap_map[name] = int(extra_gap.total_seconds() // 60)
-                prev_type_map[name] = booking_type(last_row)
+                applied_gap_min_map[nm] = int(extra_gap.total_seconds() // 60)
+                prev_type_map[nm] = booking_type(last_row)
             else:
-                available_at_map[name] = st_dt
-                applied_gap_map[name] = 0
-                prev_type_map[name] = None
+                applied_gap_min_map[nm] = 0
+                prev_type_map[nm] = None
 
-            feasible.append(name)
-            hard_needed[name] = (flex == "hard")
+            # feasible; fairness metric
+            load_ratio = states[nm]["count"] / states[nm]["shift_hours"]
+            ring_distance = (idx - cursor) % n
+            feasible.append((nm, load_ratio, ring_distance))
 
         if not feasible:
-            rides.at[i, "Notes"] = ("No " + FAR_CAR_ID + " driver free (window/gap)") if far_req else "No driver free (window/gap)"
+            rides.at[i, "Notes"] = "No driver free (window/gap)"
+            # IMPORTANT: do NOT move cursor when no one was assigned
             continue
 
-        # Balanced selection: fewest jobs, then smallest idle time
-        def _key(nm):
-            idle = (pickup_dt - available_at_map[nm]).total_seconds()
-            if idle < 0:
-                idle = float('inf')
-            return (states[nm]["count"], idle)
-
-        chosen = min(feasible, key=_key)
-        chosen_hard = hard_needed[chosen]
+        # Choose: lowest load ratio; tie -> closest ahead of cursor
+        feasible.sort(key=lambda t: (t[1], t[2]))
+        chosen, _, chosen_ring_dist = feasible[0]
+        chosen_idx = (cursor + chosen_ring_dist) % len(active)
         chosen_car = states[chosen]["car"]
 
-        # lock assignment
-        last_row_prev = states[chosen]["last_row"]
-        applied_gap_min = applied_gap_map.get(chosen, 0)
-        prev_type = prev_type_map.get(chosen, None)
-        this_type = booking_type(row)
-
+        # Lock assignment
         states[chosen]["last_row"] = row.copy()
         states[chosen]["count"] += 1
 
-        # Note formatting
+        this_type = booking_type(row)
+        prev_type = prev_type_map.get(chosen)
+        gap_mins  = applied_gap_min_map.get(chosen, 0)
+
         busy_until = pickup_dt + busy_td
         note_parts = [f"Busy until {busy_until.strftime('%H:%M')}"]
-        if chosen_hard:
-            note_parts.append("Hard Early Start")
-        if applied_gap_min and prev_type:
-            note_parts.append(f"Gap {prev_type}➜{this_type} {applied_gap_min}m")
+        if gap_mins and prev_type:
+            note_parts.append(f"Gap {prev_type}➜{this_type} {gap_mins}m")
         if far_req and chosen_car != FAR_CAR_ID:
             note_parts.append(f"WARNING: far-away not on {FAR_CAR_ID}")
-        note = " · ".join(note_parts)
-
         rides.at[i, "Assigned Driver"] = chosen
         rides.at[i, "Car"] = chosen_car
-        rides.at[i, "Notes"] = note
+        rides.at[i, "Notes"] = " · ".join(note_parts)
+
+        # Advance cursor to the slot AFTER the chosen driver
+        if active:
+            cursor = (chosen_idx + 1) % len(active)
 
     return rides, roster, effective_windows
 
