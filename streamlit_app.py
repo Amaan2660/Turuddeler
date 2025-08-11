@@ -140,7 +140,7 @@ AIRPORT_KW = {
     "københavns lufthavn", "lufthavn"
 }
 # CPH area (keep "kastrup" as city indicator)
-CPH_KW = {"copenhagen", "københavn", "cph", "kastrup", "frederiksberg"}
+CPH_KW = {"copenhagen", "københavn", "cph", "frederiksberg"}
 
 FAR_DISTANCE_KM = 45.0
 FAR_CAR_ID = "209"
