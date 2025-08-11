@@ -3,7 +3,7 @@ import re
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 
 # =========================
 # Robust DB URL resolution
@@ -29,7 +29,7 @@ if db_url.startswith("postgresql") and "sslmode=" not in db_url:
 engine = create_engine(db_url, pool_pre_ping=True)
 
 # =========================
-# Schema (save drivers' working times per date + named profiles)
+# Schema (per-date shifts + per-driver defaults)
 # =========================
 def ensure_schema():
     ddl1 = """
@@ -43,26 +43,17 @@ def ensure_schema():
     );
     """
     ddl2 = """
-    CREATE TABLE IF NOT EXISTS shift_profiles (
-        profile_name TEXT PRIMARY KEY,
-        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """
-    ddl3 = """
-    CREATE TABLE IF NOT EXISTS shift_profile_entries (
-        profile_name TEXT NOT NULL,
-        driver_name  TEXT NOT NULL,
-        start_hhmm   TEXT NULL,
-        end_hhmm     TEXT NULL,
+    CREATE TABLE IF NOT EXISTS driver_defaults (
+        driver_name   TEXT PRIMARY KEY,
+        start_hhmm    TEXT NULL,
+        end_hhmm      TEXT NULL,
         preferred_car TEXT NULL,
-        PRIMARY KEY (profile_name, driver_name),
-        FOREIGN KEY (profile_name) REFERENCES shift_profiles(profile_name) ON DELETE CASCADE
+        updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
     with engine.begin() as conn:
         conn.execute(text(ddl1))
         conn.execute(text(ddl2))
-        conn.execute(text(ddl3))
 
 def _dialect():
     return engine.dialect.name
@@ -99,62 +90,39 @@ def load_shifts_for_date(service_date: date) -> pd.DataFrame:
         )
     return df
 
-# ---- Profiles (times only, no dates) ----
-def list_profiles() -> list:
+def get_default_for_driver(driver_name: str):
     with engine.connect() as conn:
-        rows = conn.execute(text("SELECT profile_name FROM shift_profiles ORDER BY profile_name")).fetchall()
-    return [r[0] for r in rows]
+        row = conn.execute(
+            text("SELECT start_hhmm, end_hhmm, preferred_car FROM driver_defaults WHERE driver_name = :n"),
+            {"n": driver_name}
+        ).fetchone()
+    if not row:
+        return None, None, ""
+    return row[0], row[1], (row[2] or "")
 
-def save_profile(profile_name: str, driver_rows: list):
-    """Save/replace a profile from driver_rows (start/end taken as HH:MM strings)."""
-    if not profile_name:
-        raise ValueError("Profile name is required.")
-    entries = []
-    for r in driver_rows:
-        nm = r["name"]
-        st_ts = r.get("start")
-        en_ts = r.get("end")
-        pc = (r.get("preferred_car") or "")
-        st_hhmm = datetime.strftime(st_ts, "%H:%M") if isinstance(st_ts, datetime) else None
-        en_hhmm = datetime.strftime(en_ts, "%H:%M") if isinstance(en_ts, datetime) else None
-        entries.append((nm, st_hhmm, en_hhmm, pc))
-
-    with engine.begin() as conn:
-        if _dialect() == "postgresql":
-            conn.execute(text("""
-                INSERT INTO shift_profiles (profile_name) VALUES (:p)
-                ON CONFLICT (profile_name) DO NOTHING;
-            """), {"p": profile_name})
-        else:
-            conn.execute(text("""
-                INSERT OR IGNORE INTO shift_profiles (profile_name) VALUES (:p);
-            """), {"p": profile_name})
-
-        conn.execute(text("DELETE FROM shift_profile_entries WHERE profile_name = :p"), {"p": profile_name})
-
-        ins = text("""
-            INSERT INTO shift_profile_entries (profile_name, driver_name, start_hhmm, end_hhmm, preferred_car)
-            VALUES (:p, :n, :s, :e, :c)
+def upsert_default_for_driver(driver_name: str, start_hhmm: str|None, end_hhmm: str|None, preferred_car: str):
+    if _dialect() == "postgresql":
+        sql = text("""
+            INSERT INTO driver_defaults (driver_name, start_hhmm, end_hhmm, preferred_car)
+            VALUES (:n, :s, :e, :p)
+            ON CONFLICT (driver_name)
+            DO UPDATE SET start_hhmm = EXCLUDED.start_hhmm,
+                          end_hhmm = EXCLUDED.end_hhmm,
+                          preferred_car = EXCLUDED.preferred_car,
+                          updated_at = CURRENT_TIMESTAMP;
         """)
-        for nm, s, e, pc in entries:
-            conn.execute(ins, {"p": profile_name, "n": nm, "s": s, "e": e, "c": pc})
-
-def load_profile(profile_name: str, service_date: date) -> pd.DataFrame:
-    with engine.connect() as conn:
-        rows = conn.execute(text("""
-            SELECT driver_name, start_hhmm, end_hhmm, preferred_car
-            FROM shift_profile_entries
-            WHERE profile_name = :p
-            ORDER BY driver_name
-        """), {"p": profile_name}).fetchall()
-    if not rows:
-        return pd.DataFrame(columns=["name","start","end","preferred_car"])
-    recs = []
-    for driver_name, start_hhmm, end_hhmm, pc in rows:
-        st_dt = datetime.combine(service_date, datetime.strptime(start_hhmm, "%H:%M").time()) if start_hhmm else None
-        en_dt = datetime.combine(service_date, datetime.strptime(end_hhmm, "%H:%M").time()) if end_hhmm else None
-        recs.append({"name": driver_name, "start": st_dt, "end": en_dt, "preferred_car": pc or ""})
-    return pd.DataFrame(recs)
+    else:
+        sql = text("""
+            INSERT INTO driver_defaults (driver_name, start_hhmm, end_hhmm, preferred_car)
+            VALUES (:n, :s, :e, :p)
+            ON CONFLICT(driver_name) DO UPDATE SET
+                start_hhmm = excluded.start_hhmm,
+                end_hhmm = excluded.end_hhmm,
+                preferred_car = excluded.preferred_car,
+                updated_at = CURRENT_TIMESTAMP;
+        """)
+    with engine.begin() as conn:
+        conn.execute(sql, {"n": driver_name, "s": start_hhmm, "e": end_hhmm, "p": preferred_car})
 
 ensure_schema()
 
@@ -171,20 +139,20 @@ AIRPORT_KW = {
     "cph", "cph airport", "copenhagen airport",
     "københavns lufthavn", "lufthavn"
 }
-# CPH area keywords (keep "kastrup" as district indicator)
+# CPH area (keep "kastrup" as city indicator)
 CPH_KW = {"copenhagen", "københavn", "cph", "kastrup", "frederiksberg"}
 
 FAR_DISTANCE_KM = 45.0
 FAR_CAR_ID = "209"
 
-# Default type→type gap matrix (minutes)
+# Default TYPE→TYPE gaps (minutes)
 DEFAULT_GAP_MATRIX = {
     "C2C": {"C2C": 25, "A2C": 30, "C2A": 25},
     "A2C": {"C2C": 50, "A2C": 50, "C2A": 50},
     "C2A": {"C2C": 50, "A2C": 0,  "C2A": 40},
 }
 
-# Column candidates (NOTE: "Drop Off" first)
+# Column candidates (NOTE: prefer exact "Drop Off")
 PICKUP_CANDIDATES  = [
     "Pickup","Pick Up","Pick up","Pickup Address","From","Start",
     "Start Address","PickupLocation","Pickup Loc","Pick Up Address"
@@ -207,10 +175,7 @@ def _first_present(row: pd.Series, candidates) -> str:
 def load_drivers():
     """drivers table with columns: driver_id, name, number"""
     with engine.connect() as conn:
-        df = pd.read_sql(
-            "SELECT driver_id AS id, name, number FROM drivers ORDER BY name",
-            conn
-        )
+        df = pd.read_sql("SELECT driver_id AS id, name, number FROM drivers ORDER BY name", conn)
     return df
 
 # =========================
@@ -246,7 +211,7 @@ def parse_float_maybe(value):
     except:
         return None
 
-# --- distance detection ---
+# Distance detection
 DISTANCE_CANDIDATES = [
     "Distance_km","Distance (km)","KM","Km","km","distance","distance km","Total Km","Total_km"
 ]
@@ -268,14 +233,14 @@ def get_pickup_text(row: pd.Series) -> str:
 def get_dropoff_text(row: pd.Series) -> str:
     return _first_present(row, DROPOFF_CANDIDATES)
 
-# -------- Route type (restricted to 3 types) --------
+# Route type (3 buckets only)
 def booking_type(row: pd.Series) -> str:
     pick = get_pickup_text(row)
     drop = get_dropoff_text(row)
     pick_air = is_airport_place(pick)
     drop_air = is_airport_place(drop)
     if pick_air and drop_air:
-        return "A2C"
+        return "A2C"   # normalize A->A into A2C per your ops
     if pick_air and not drop_air:
         return "A2C"
     if (not pick_air) and drop_air:
@@ -283,6 +248,12 @@ def booking_type(row: pd.Series) -> str:
     return "C2C"
 
 def busy_block_for_row(row: pd.Series) -> timedelta:
+    """
+    Busy time from pickup:
+      - Roadshow/Site Inspection: Duration Minutes/Hours, else Trip + 60.
+      - Far-away (km >= FAR_DISTANCE_KM): Trip + (30 if pickup is airport).
+      - Else: Trip (or 30 fallback).
+    """
     trip_min = parse_minutes(row.get("Trip Minutes")) or 30
     distance_km = get_distance_km(row)
     pickup_txt = get_pickup_text(row)
@@ -307,7 +278,7 @@ def busy_block_for_row(row: pd.Series) -> timedelta:
 
     return timedelta(minutes=trip_min)
 
-# ---- Cancelled bookings helper (robust) ----
+# Cancelled bookings helper (robust)
 CANCEL_MATCHES = ("cancel", "cancelled", "canceled", "no show", "no-show", "noshow")
 STATUS_EXACT = {
     "status", "booking status", "ride status", "trip status", "job status",
@@ -335,6 +306,7 @@ def row_is_cancelled(row: pd.Series) -> bool:
     return False
 
 def rule_gap_after(prev_row: pd.Series, next_row: pd.Series, gap_matrix: dict, cph_only: bool) -> timedelta:
+    """Extra gap based on prev_type ➜ next_type (C2C, A2C, C2A)."""
     if cph_only:
         prev_pick = get_pickup_text(prev_row)
         next_pick = get_pickup_text(next_row)
@@ -353,6 +325,7 @@ def extract_busy_until(note: str):
 
 def in_flex_window(pickup_dt: datetime, start_dt: datetime, end_dt: datetime,
                    soft_early: int, hard_early: int, late_allow: int):
+    """Return 'soft'/'hard'/None if pickup fits shift+flex. Overnight handled."""
     if end_dt <= start_dt:
         end_dt = end_dt + timedelta(days=1)
     soft_start = start_dt - timedelta(minutes=soft_early)
@@ -366,16 +339,16 @@ def in_flex_window(pickup_dt: datetime, start_dt: datetime, end_dt: datetime,
     return None
 
 # =========================
-# Car roster (one car per driver per shift) WITH early-finish flex
+# Car roster (strict: no overlapping windows per car)
 # =========================
-def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: timedelta, early_end_flex: timedelta):
+def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: timedelta):
     """
-    Assign exactly ONE car per driver for the entire shift.
-    Honors preferred car if possible; sequences drivers per car with handover at start.
-    NEW: previous driver's end is treated as (end - early_end_flex) for the next driver's earliest start on that car.
-    NOTE: This only affects car-to-driver mapping and effective start; real car overlap is prevented by per-booking lock.
+    Assign exactly ONE car per driver for the whole shift.
+    - Honors preferred_car when possible.
+    - STRICT: the same car cannot belong to two drivers at overlapping effective windows.
+      Next driver's effective start on a car = max(requested_start, last_effective_end + handover)
     """
-    car_prev_end = {car: datetime.min for car in active_cars}  # last scheduled END on that car (by shifts)
+    car_effective_end = {car: datetime.min for car in active_cars}  # per-car last effective end
     roster = {}
     windows = {}
 
@@ -392,38 +365,32 @@ def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: tim
         req_end = r.get("end")
         if req_start is None or req_end is None:
             today = date.today()
-            req_start = datetime.combine(today, datetime.strptime("00:00","%H:%M").time())
-            req_end   = datetime.combine(today, datetime.strptime("23:59","%H:%M").time())
+            req_start = datetime.combine(today, time(0,0))
+            req_end   = datetime.combine(today, time(23,59))
         if req_end <= req_start:
             req_end = req_end + timedelta(days=1)
 
         pref = (r.get("preferred_car") or "").strip()
-
-        # Candidate order: preferred first (if any), otherwise earliest "available"
+        # Candidate order: preferred first, else earliest-ready car
         if pref and pref in active_cars:
             candidates = [pref] + [c for c in active_cars if c != pref]
         else:
             candidates = list(active_cars)
 
         best_car = None
-        best_earliest_start = None
+        best_start = None
         for car in candidates:
-            prev_end = car_prev_end[car]
-            # allow early end flex for the *previous* driver on this car
-            if prev_end == datetime.min:
-                avail = req_start  # no prior driver on this car
-            else:
-                avail = (prev_end - early_end_flex) + handover
-            earliest_start = max(req_start, avail)
-            if best_car is None or earliest_start < best_earliest_start:
+            ready_at = car_effective_end[car] + handover
+            eff_start = max(req_start, ready_at)
+            if (best_start is None) or (eff_start < best_start):
                 best_car = car
-                best_earliest_start = earliest_start
+                best_start = eff_start
 
+        eff_end = req_end
         roster[name] = best_car
-        eff_start = best_earliest_start
-        windows[name] = (eff_start, req_end)
-        # update this car's scheduled end to this driver's requested end
-        car_prev_end[best_car] = req_end
+        windows[name] = (best_start, eff_end)
+        # advance this car's effective end to this driver's effective end
+        car_effective_end[best_car] = eff_end
 
     return roster, windows
 
@@ -455,7 +422,7 @@ def build_bilplan(plan_df: pd.DataFrame, service_date: date) -> str:
     return "\n".join(lines)
 
 # =========================
-# Assignment (round-robin + fairness + per-booking vehicle lock)
+# Assignment (round-robin + fairness + per-booking car lock)
 # =========================
 def assign_plan_with_rostered_cars(
     rides_df: pd.DataFrame,
@@ -470,10 +437,9 @@ def assign_plan_with_rostered_cars(
     respect_dates: bool,
     gap_matrix: dict,
     gap_cph_only: bool,
-    use_gap_only: bool,
-    roster_early_end_flex: timedelta
+    use_gap_only: bool
 ):
-    # 1) Preprocess rides
+    # Preprocess rides
     rides = rides_df.copy()
     try:
         rides = rides[~rides.apply(row_is_cancelled, axis=1)].copy()
@@ -504,17 +470,18 @@ def assign_plan_with_rostered_cars(
 
     rides = rides.sort_values("Pickup Time").reset_index(drop=True)
 
-    # 2) Outputs
+    # Outputs
     rides["Assigned Driver"] = ""
     rides["Car"] = ""
     rides["Notes"] = ""
 
-    # 3) Build roster + driver states (WITH early-finish flex)
-    roster, effective_windows = build_car_roster(driver_rows, active_cars, handover=car_handover, early_end_flex=roster_early_end_flex)
+    # Build roster (strict, non-overlapping per car)
+    roster, effective_windows = build_car_roster(driver_rows, active_cars, handover=car_handover)
 
+    # Driver states
     states = {}
     base_order = []
-    for _, r in driver_rows.iterrows():  # preserve UI order
+    for _, r in driver_rows.iterrows():          # keep UI order
         name = r["name"]
         car = roster.get(name, (r.get("preferred_car") or "").strip())
         if not car:
@@ -536,13 +503,14 @@ def assign_plan_with_rostered_cars(
     if not states:
         return rides, roster, effective_windows
 
-    # 4) Active list + cursor (we analyze ALL active drivers every time and then pick best)
+    # Active list + cursor
     active = []
     cursor = 0
     in_active = set()
 
     def refresh_active(now_dt: datetime):
         nonlocal active, cursor, in_active
+        # add who started
         for nm in base_order:
             if nm in in_active:
                 continue
@@ -551,6 +519,7 @@ def assign_plan_with_rostered_cars(
             if st_dt <= now_dt < en_dt:
                 active.append(nm)
                 in_active.add(nm)
+        # remove who ended
         i = 0
         while i < len(active):
             nm = active[i]
@@ -570,7 +539,7 @@ def assign_plan_with_rostered_cars(
         else:
             cursor = 0
 
-    # 5) Per-car lock state
+    # Per-car booking lock
     car_free_at = {}      # car -> datetime (end of last assigned booking)
     car_last_driver = {}  # car -> name
 
@@ -579,27 +548,26 @@ def assign_plan_with_rostered_cars(
     if has_far and FAR_CAR_ID not in active_cars:
         st.warning(f"Far-away bookings detected but car {FAR_CAR_ID} is not active. Those jobs will not be assigned.")
 
-    # 6) Assignment loop
     gm = gap_matrix or DEFAULT_GAP_MATRIX
 
+    # Assignment loop
     for i, row in rides.iterrows():
         pickup_dt = row["Pickup Time"]
         busy_td = busy_block_for_row(row)
         far_req = is_far_away_row(row)
 
         refresh_active(pickup_dt)
-
         if not active:
             rides.at[i, "Notes"] = "No driver free (no active shifts)"
             continue
 
-        # Analyze the WHOLE active list, then choose best
         n = len(active)
         order = [(cursor + k) % n for k in range(n)]
         feasible = []
         applied_gap_min_map = {}
         prev_type_map = {}
 
+        # Analyze all active drivers, then choose best
         for idx in order:
             nm = active[idx]
             car = states[nm]["car"]
@@ -637,14 +605,14 @@ def assign_plan_with_rostered_cars(
                 applied_gap_min_map[nm] = 0
                 prev_type_map[nm] = None
 
-            # vehicle lock (+ handover if driver switches)
+            # vehicle lock (+ handover if switching drivers)
             car_free = car_free_at.get(car, datetime.min)
             needs_handover = (car_last_driver.get(car) is not None and car_last_driver.get(car) != nm)
             car_ready = car_free + (car_handover if needs_handover else timedelta(0))
             if pickup_dt < car_ready:
                 continue
 
-            # feasible; fairness
+            # fairness metric
             load_ratio = states[nm]["count"] / states[nm]["shift_hours"]
             ring_distance = (idx - cursor) % n
             feasible.append((nm, load_ratio, ring_distance))
@@ -653,7 +621,6 @@ def assign_plan_with_rostered_cars(
             rides.at[i, "Notes"] = "No driver free (window/gap/car)"
             continue
 
-        # Choose: lowest load ratio; tie -> closest ahead of cursor
         feasible.sort(key=lambda t: (t[1], t[2]))
         chosen, _, chosen_ring_dist = feasible[0]
         chosen_idx = (cursor + chosen_ring_dist) % len(active)
@@ -664,7 +631,7 @@ def assign_plan_with_rostered_cars(
         states[chosen]["last_row"] = row.copy()
         states[chosen]["count"] += 1
 
-        # car state
+        # per-car state
         needs_handover_note = ""
         if car_last_driver.get(chosen_car) is not None and car_last_driver[chosen_car] != chosen:
             needs_handover_note = f"Handover {int(car_handover.total_seconds()//60)}m"
@@ -703,7 +670,7 @@ def get_booking_id(row: pd.Series) -> str:
             return str(row[k]).strip()
     return ""
 
-# normalize/mirror columns used in UI
+# Mirror helper
 def ensure_column(df: pd.DataFrame, target: str, cands: list):
     if target in df.columns:
         return
@@ -719,7 +686,7 @@ def ensure_column(df: pd.DataFrame, target: str, cands: list):
 st.set_page_config(page_title="🚖 Daily Car Plan", page_icon="🚗", layout="wide")
 st.title("🚖 Daily Car Plan")
 
-# session buckets
+# session state
 if "rides_df" not in st.session_state:
     st.session_state.rides_df = None
 if "driver_rows" not in st.session_state:
@@ -743,7 +710,7 @@ tab_rides, tab_setup, tab_plan = st.tabs(["📄 Rides", "👥 Drivers & Settings
 with tab_rides:
     st.subheader("Load rides once")
     up = st.file_uploader("Upload today's rides CSV", type=["csv"], key="uploader")
-    if up:
+    if up is not None:
         tmp = pd.read_csv(up).fillna("")
         st.dataframe(tmp.head(30), use_container_width=True, height=260)
         if st.button("Use this file"):
@@ -758,7 +725,7 @@ with tab_rides:
 
 # ===== Drivers & Settings tab =====
 with tab_setup:
-    st.subheader("Service date & DB shifts")
+    st.subheader("Service date & saved shifts")
     sd = st.date_input("Service date", value=st.session_state.service_date, key="svc_date_picker")
     st.session_state.service_date = sd
 
@@ -776,6 +743,7 @@ with tab_setup:
 
     st.markdown("---")
     st.subheader("Drivers & Timing (saved only on submit)")
+
     with st.form("driver_setup_form", clear_on_submit=False):
         # Active cars
         default_active = [c for c in CAR_POOL if c.lower() != "s-klasse"]
@@ -786,43 +754,69 @@ with tab_setup:
         )
 
         # Respect dates in file
-        respect_dates = st.checkbox("Respect dates in file (keep them if present)", value=st.session_state.settings.get("respect_dates", True))
+        respect_dates = st.checkbox(
+            "Respect dates in file (keep them if present)",
+            value=st.session_state.settings.get("respect_dates", True)
+        )
 
         # Driver multi-select and per-driver inputs
         all_names = drivers_df["name"].tolist()
+
+        # Build a set of default selections: from session or just first N
         if st.session_state.driver_rows:
             default_names = [r["name"] for r in st.session_state.driver_rows]
         else:
             default_names = all_names[:min(len(all_names), 12)]
+
         selected = st.multiselect("Drivers today", options=all_names, default=default_names)
 
+        # Build UI rows with **live defaults per driver**
         rows = []
         cols = st.columns(2)
-        saved_rows_df = pd.DataFrame(st.session_state.driver_rows) if st.session_state.driver_rows else pd.DataFrame(columns=["name","start","end","preferred_car"])
+
+        # Quick dict for any previously loaded (date) shifts in session
+        prior = {r["name"]: r for r in (st.session_state.driver_rows or [])}
+
         for i, name in enumerate(selected):
             with cols[i % 2]:
                 st.markdown(f"**{name}**")
-                rec = {}
-                if not saved_rows_df.empty and name in saved_rows_df["name"].values:
-                    rec = saved_rows_df.loc[saved_rows_df["name"] == name].iloc[0].to_dict()
-                start_time = st.time_input(
-                    f"{name} start time",
-                    value=(pd.to_datetime(rec["start"]).time() if rec.get("start") not in (None, "", pd.NaT) else None),
-                    key=f"st_{name}"
-                )
-                end_time   = st.time_input(
-                    f"{name} end time",
-                    value=(pd.to_datetime(rec["end"]).time() if rec.get("end") not in (None, "", pd.NaT) else None),
-                    key=f"et_{name}"
-                )
-                pref = st.selectbox(
-                    f"{name} preferred car",
-                    [""] + active_cars,
-                    index=([""] + active_cars).index(rec.get("preferred_car","")) if rec.get("preferred_car","") in ([""] + active_cars) else 0,
-                    key=f"pref_{name}"
-                )
+
+                # 1) Start with any per-date shift in memory
+                preset_start = prior.get(name, {}).get("start")
+                preset_end   = prior.get(name, {}).get("end")
+                preset_car   = prior.get(name, {}).get("preferred_car", "")
+
+                # 2) If none, try per-driver defaults
+                if not preset_start or not isinstance(preset_start, datetime):
+                    def_st, def_en, def_car = get_default_for_driver(name)
+                    if def_st:
+                        try:
+                            hh, mm = map(int, def_st.split(":"))
+                            preset_start = datetime.combine(st.session_state.service_date, time(hh, mm))
+                        except:
+                            preset_start = None
+                    if def_en:
+                        try:
+                            hh, mm = map(int, def_en.split(":"))
+                            preset_end = datetime.combine(st.session_state.service_date, time(hh, mm))
+                        except:
+                            preset_end = None
+                    if not preset_car:
+                        preset_car = def_car or ""
+
+                # Convert to time values for widgets
+                start_val = preset_start.time() if isinstance(preset_start, datetime) else None
+                end_val   = preset_end.time() if isinstance(preset_end, datetime) else None
+                pref_val  = preset_car if preset_car in ([""] + active_cars) else ""
+
+                start_time = st.time_input(f"{name} start time", value=start_val, key=f"st_{name}")
+                end_time   = st.time_input(f"{name} end time",   value=end_val, key=f"et_{name}")
+                pref       = st.selectbox(f"{name} preferred car", [""] + active_cars, index=([""] + active_cars).index(pref_val) if pref_val in ([""] + active_cars) else 0, key=f"pref_{name}")
+
+                # Combine with service date (treat empty as full-day later)
                 start_dt = datetime.combine(st.session_state.service_date, start_time) if start_time else None
                 end_dt   = datetime.combine(st.session_state.service_date, end_time) if end_time else None
+
                 rows.append({"name": name, "start": start_dt, "end": end_dt, "preferred_car": pref})
 
         driver_rows_live = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["name","start","end","preferred_car"])
@@ -835,9 +829,6 @@ with tab_setup:
         late_min = st.slider("Late end allowed (min)", 0, 120, st.session_state.settings.get("late_allow", 20), 5)
         auto_relax = st.checkbox("If a job is unassigned for window only, auto-relax to SOFT", value=st.session_state.settings.get("auto_relax", True))
         use_gap_only = st.checkbox("Use TYPE gaps only for chaining (ignore Trip Minutes)", value=st.session_state.settings.get("use_gap_only", True))
-
-        # NEW: early finish flex in roster
-        roster_early_end_min = st.slider("Allow previous driver to finish up to (min) EARLY (roster only)", 0, 120, st.session_state.settings.get("roster_early_end_min", 60), 5)
 
         st.markdown("#### Gap rules between booking TYPES (prev ➜ next)")
         st.caption("Types: C2C (City→City), A2C (Airport→City), C2A (City→Airport)")
@@ -852,10 +843,25 @@ with tab_setup:
                 default_val = int(st.session_state.settings.get("gap_matrix", DEFAULT_GAP_MATRIX).get(r, {}).get(c, DEFAULT_GAP_MATRIX[r][c]))
                 gap_matrix[r][c] = row_cols[j].number_input(f"{r} ➜ {c}", 0, 240, default_val, 5, key=f"gap_{r}_{c}")
 
+        # Submit saves to session
         submitted = st.form_submit_button("Save driver setup (kept in session)")
         if submitted:
+            # Fill empties: if no times, assume full day
+            fixed_rows = []
+            for r in rows:
+                st_dt = r["start"]
+                en_dt = r["end"]
+                if st_dt is None and en_dt is None:
+                    st_dt = datetime.combine(st.session_state.service_date, time(0,0))
+                    en_dt = datetime.combine(st.session_state.service_date, time(23,59))
+                elif st_dt is None and en_dt is not None:
+                    st_dt = datetime.combine(st.session_state.service_date, time(0,0))
+                elif st_dt is not None and en_dt is None:
+                    en_dt = datetime.combine(st.session_state.service_date, time(23,59))
+                fixed_rows.append({**r, "start": st_dt, "end": en_dt})
+
             st.session_state.active_cars = list(active_cars)
-            st.session_state.driver_rows = driver_rows_live.to_dict("records")
+            st.session_state.driver_rows = fixed_rows
             st.session_state.settings = {
                 "service_date": st.session_state.service_date,
                 "respect_dates": bool(respect_dates),
@@ -867,68 +873,36 @@ with tab_setup:
                 "gap_matrix": gap_matrix,
                 "gap_cph_only": bool(gap_cph_only),
                 "use_gap_only": bool(use_gap_only),
-                "roster_early_end_min": int(roster_early_end_min),
             }
             st.success("Setup saved in session.")
 
-    # Save current setup (driver working times) to DB for this date
+    # Save per-date shifts
     if st.session_state.driver_rows:
-        if st.button("💾 Save these drivers' working times to DB (for this date)"):
-            for r in st.session_state.driver_rows:
-                upsert_shift_row(
-                    service_date=st.session_state.service_date,
-                    name=r["name"],
-                    start_ts=r.get("start"),
-                    end_ts=r.get("end"),
-                    preferred_car=(r.get("preferred_car") or "")
-                )
-            st.success(f"Saved {len(st.session_state.driver_rows)} shift(s) for {st.session_state.service_date}.")
-
-    # ---- Profiles UI ----
-    st.markdown("---")
-    st.subheader("Shift Profiles (times only, no dates)")
-
-    existing = list_profiles()
-    colp1, colp2 = st.columns([2,1])
-    with colp1:
-        profile_name = st.text_input("Profile name (create or overwrite)")
-    with colp2:
-        pick_existing = st.selectbox("Existing profiles", options=[""] + existing, index=0)
-
-    cpa, cpb, cpc = st.columns(3)
-    with cpa:
-        if st.button("Save current drivers as profile"):
-            if not st.session_state.driver_rows:
-                st.warning("Save driver setup first (top of this tab), then save as profile.")
-            else:
-                try:
-                    save_profile(profile_name.strip(), st.session_state.driver_rows)
-                    st.success(f"Saved profile '{profile_name}'.")
-                except Exception as e:
-                    st.error(f"Failed to save profile: {e}")
-    with cpb:
-        if st.button("Load selected profile into today"):
-            name_to_load = pick_existing or profile_name.strip()
-            if not name_to_load:
-                st.warning("Pick or type a profile name to load.")
-            else:
-                dfp = load_profile(name_to_load, st.session_state.service_date)
-                if dfp.empty:
-                    st.warning(f"No entries found for profile '{name_to_load}'.")
-                else:
-                    st.session_state.driver_rows = dfp.to_dict("records")
-                    st.success(f"Loaded profile '{name_to_load}' for {st.session_state.service_date}.")
-    with cpc:
-        if st.button("Delete selected profile"):
-            name_to_delete = pick_existing or profile_name.strip()
-            if not name_to_delete:
-                st.warning("Pick or type a profile name to delete.")
-            else:
-                with engine.begin() as conn:
-                    conn.execute(text("DELETE FROM shift_profile_entries WHERE profile_name = :p"), {"p": name_to_delete})
-                    conn.execute(text("DELETE FROM shift_profiles WHERE profile_name = :p"), {"p": name_to_delete})
-                st.success(f"Deleted profile '{name_to_delete}'.")
-                st.rerun()
+        colS1, colS2 = st.columns(2)
+        with colS1:
+            if st.button("💾 Save these drivers' working times to DB (this date)"):
+                for r in st.session_state.driver_rows:
+                    upsert_shift_row(
+                        service_date=st.session_state.service_date,
+                        name=r["name"],
+                        start_ts=r.get("start"),
+                        end_ts=r.get("end"),
+                        preferred_car=(r.get("preferred_car") or "")
+                    )
+                st.success(f"Saved {len(st.session_state.driver_rows)} shift(s) for {st.session_state.service_date}.")
+        with colS2:
+            if st.button("⭐ Save as per-driver defaults"):
+                count = 0
+                for r in st.session_state.driver_rows:
+                    name = r["name"]
+                    s_dt = r.get("start")
+                    e_dt = r.get("end")
+                    s_hhmm = s_dt.strftime("%H:%M") if isinstance(s_dt, datetime) else None
+                    e_hhmm = e_dt.strftime("%H:%M") if isinstance(e_dt, datetime) else None
+                    pref = r.get("preferred_car") or ""
+                    upsert_default_for_driver(name, s_hhmm, e_hhmm, pref)
+                    count += 1
+                st.success(f"Saved defaults for {count} driver(s).")
 
 # ===== Plan tab =====
 with tab_plan:
@@ -965,15 +939,14 @@ with tab_plan:
                 gap_matrix=settings["gap_matrix"],
                 gap_cph_only=settings["gap_cph_only"],
                 use_gap_only=settings["use_gap_only"],
-                roster_early_end_flex=timedelta(minutes=settings.get("roster_early_end_min", 60)),
             )
         except Exception as e:
             st.error(f"Planning failed: {e}")
             st.stop()
 
-        # Normalize columns for display (use exact Drop Off when present)
+        # Normalize for display/exports
         ensure_column(plan_df, "Pickup", PICKUP_CANDIDATES)
-        ensure_column(plan_df, "Dropoff", DROPOFF_CANDIDATES)
+        ensure_column(plan_df, "Dropoff", DROPOFF_CANDIDATES)  # prefers "Drop Off"
         ensure_column(plan_df, "Name", ["Pax Name","Passenger Name","PAX","Pax","Client Name","Customer Name"])
 
         show_debug_type = st.checkbox("Show detected Type column (C2C/A2C/C2A)", value=False)
