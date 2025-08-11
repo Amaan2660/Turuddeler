@@ -195,7 +195,6 @@ def is_cph_area(text: str) -> bool:
     return any(k in s for k in CPH_KW)
 
 def is_copenhagen(a: str, b: str) -> bool:
-    # kept for compatibility
     s1, s2 = _norm(a), _norm(b)
     return any(k in s1 for k in CPH_KW) or any(k in s2 for k in CPH_KW)
 
@@ -800,7 +799,6 @@ with tab_setup:
 
         # Build presets (per-date first, then per-driver defaults), seed widget keys, then cascade
         selected = st.session_state.selected_drivers
-        rows_preview = []
         cols = st.columns(2)
         prior = {r["name"]: r for r in (st.session_state.driver_rows or [])}
         service_day = st.session_state.service_date
@@ -1004,7 +1002,45 @@ with tab_plan:
     if st.button("Generate / Update Plan"):
         rides_df_live = pd.DataFrame(rides_df).fillna("")
         driver_rows_live = pd.DataFrame(driver_rows)
-        svc_date = settings.get("service_date", st.session_state.service_date)
+
+        # ALWAYS use the live picker date (works for tomorrow too)
+        svc_date = st.session_state.service_date
+
+        # Rebase driver shift datetimes to the CURRENT service date at plan time
+        def _rebase_to_service_date(dt_obj):
+            if isinstance(dt_obj, pd.Timestamp):
+                dt_obj = dt_obj.to_pydatetime()
+            if isinstance(dt_obj, datetime):
+                return datetime.combine(svc_date, dt_obj.time())
+            return None
+
+        if "start" in driver_rows_live.columns:
+            driver_rows_live["start"] = driver_rows_live["start"].apply(_rebase_to_service_date)
+        if "end" in driver_rows_live.columns:
+            driver_rows_live["end"]   = driver_rows_live["end"].apply(_rebase_to_service_date)
+
+        # Optional: warn if rides' dates don't match service date while respecting CSV dates
+        respect_dates_flag = settings.get("respect_dates", True)
+        if respect_dates_flag:
+            csv_dates = None
+            if "Date" in rides_df_live.columns and rides_df_live["Date"].notna().any():
+                try:
+                    csv_dates = pd.to_datetime(rides_df_live["Date"], errors="coerce").dt.date.dropna()
+                except Exception:
+                    csv_dates = None
+            if csv_dates is None or csv_dates.empty:
+                try:
+                    csv_dates = pd.to_datetime(rides_df_live["Pickup Time"], errors="coerce").dt.date.dropna()
+                except Exception:
+                    csv_dates = None
+            if csv_dates is not None and not csv_dates.empty:
+                csv_mode = csv_dates.mode().iloc[0]
+                if csv_mode != svc_date:
+                    st.warning(
+                        f"The rides file uses {csv_mode} but Service date is {svc_date}. "
+                        "With 'Respect dates in file' ON, rides stay on the CSV date. "
+                        "Either change Service date to match the file or turn that option OFF."
+                    )
 
         try:
             plan_df, roster, eff_windows = assign_plan_with_rostered_cars(
