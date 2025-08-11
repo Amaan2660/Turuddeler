@@ -237,6 +237,51 @@ def get_pickup_text(row: pd.Series) -> str:
 def get_dropoff_text(row: pd.Series) -> str:
     return _first_present(row, DROPOFF_CANDIDATES)
 
+# --------- EU-first date/time helpers (added) ---------
+_DATE_RE = re.compile(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}")
+
+def _parse_date_eu_first(val) -> date | None:
+    try:
+        d = pd.to_datetime(val, errors="coerce", dayfirst=True)
+        return d.date() if pd.notna(d) else None
+    except Exception:
+        return None
+
+def _parse_time_only(val) -> time | None:
+    s = str(val).strip()
+    if not s:
+        return None
+    # allow 4-digit 0915
+    if re.fullmatch(r"\d{3,4}", s):
+        s = s.zfill(4)
+        s = f"{s[:2]}:{s[2:]}"
+    for fmt in ("%H:%M", "%H.%M", "%H%M"):
+        try:
+            return datetime.strptime(s, fmt).time()
+        except Exception:
+            continue
+    try:
+        t = pd.to_datetime(s, errors="coerce", format="%H:%M")
+        if pd.notna(t):
+            return t.time()
+    except Exception:
+        pass
+    return None
+
+def _parse_dt_maybe(val, service_date: date) -> datetime | None:
+    s = str(val).strip()
+    if not s:
+        return None
+    if _DATE_RE.search(s):
+        d = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        if pd.isna(d):
+            return None
+        return d.to_pydatetime()
+    t = _parse_time_only(s)
+    if t is None:
+        return None
+    return datetime.combine(service_date, t)
+
 # Route type (3 buckets only)
 def booking_type(row: pd.Series) -> str:
     pick = get_pickup_text(row)
@@ -462,25 +507,31 @@ def assign_plan_with_rostered_cars(
 
     if "Pickup Time" not in rides.columns:
         raise ValueError("CSV must include 'Pickup Time' column.")
-    rides["Pickup Time"] = pd.to_datetime(rides["Pickup Time"], errors="coerce")
-    if rides["Pickup Time"].isna().any():
-        raise ValueError("Some 'Pickup Time' values are invalid. Use 'HH:MM' or 'YYYY-MM-DD HH:MM'.")
 
-    def _anchor(dt: pd.Timestamp) -> datetime:
-        if pd.isna(dt):
-            return dt
-        if respect_dates and (dt.date() != datetime(1970,1,1).date()):
-            return dt.to_pydatetime()
-        return datetime.combine(service_date, dt.time())
-
-    if respect_dates and "Date" in rides.columns and rides["Date"].notna().any():
-        try:
-            dcol = pd.to_datetime(rides["Date"], errors="coerce").dt.date
-            rides["Pickup Time"] = pd.to_datetime(dcol.astype(str) + " " + rides["Pickup Time"].dt.strftime("%H:%M"))
-        except Exception:
-            rides["Pickup Time"] = rides["Pickup Time"].apply(_anchor)
+    # --------- EU-first parsing for pickups (fix) ---------
+    if respect_dates and "Date" in rides.columns and rides["Date"].astype(str).str.strip().ne("").any():
+        # Use explicit Date (EU day-first) + time from Pickup Time unless PT already has a date
+        rides["_parsed_date"] = rides["Date"].apply(_parse_date_eu_first)
+        def _combine_row(row):
+            d = row["_parsed_date"]
+            raw_pt = row["Pickup Time"]
+            if d is None:
+                return _parse_dt_maybe(raw_pt, service_date)
+            # if PT has its own date, parse that; else combine time with row date
+            if _DATE_RE.search(str(raw_pt)):
+                return _parse_dt_maybe(raw_pt, service_date)
+            t = _parse_time_only(raw_pt)
+            if t is None:
+                return None
+            return datetime.combine(d, t)
+        rides["Pickup Time"] = rides.apply(_combine_row, axis=1)
+        rides.drop(columns=["_parsed_date"], inplace=True)
     else:
-        rides["Pickup Time"] = rides["Pickup Time"].apply(_anchor)
+        # No Date col respected -> parse PT: if it contains a date (EU-first), keep it; else anchor to service_date
+        rides["Pickup Time"] = rides["Pickup Time"].apply(lambda v: _parse_dt_maybe(v, service_date))
+
+    if rides["Pickup Time"].isna().any():
+        raise ValueError("Some 'Pickup Time' values are invalid with EU day-first/time-only parsing.")
 
     rides = rides.sort_values("Pickup Time").reset_index(drop=True)
 
@@ -1019,18 +1070,22 @@ with tab_plan:
         if "end" in driver_rows_live.columns:
             driver_rows_live["end"]   = driver_rows_live["end"].apply(_rebase_to_service_date)
 
-        # Optional: warn if rides' dates don't match service date while respecting CSV dates
+        # Optional: warn if rides' dates don't match service date while respecting CSV dates (EU-first)
         respect_dates_flag = settings.get("respect_dates", True)
         if respect_dates_flag:
             csv_dates = None
-            if "Date" in rides_df_live.columns and rides_df_live["Date"].notna().any():
+            if "Date" in rides_df_live.columns and rides_df_live["Date"].astype(str).str.strip().ne("").any():
                 try:
-                    csv_dates = pd.to_datetime(rides_df_live["Date"], errors="coerce").dt.date.dropna()
+                    csv_dates = pd.to_datetime(rides_df_live["Date"], errors="coerce", dayfirst=True).dt.date.dropna()
                 except Exception:
                     csv_dates = None
             if csv_dates is None or csv_dates.empty:
                 try:
-                    csv_dates = pd.to_datetime(rides_df_live["Pickup Time"], errors="coerce").dt.date.dropna()
+                    # try to parse any date embedded in Pickup Time using dayfirst too
+                    s = rides_df_live["Pickup Time"].astype(str)
+                    mask = s.str.contains(_DATE_RE)
+                    if mask.any():
+                        csv_dates = pd.to_datetime(s[mask], errors="coerce", dayfirst=True).dt.date.dropna()
                 except Exception:
                     csv_dates = None
             if csv_dates is not None and not csv_dates.empty:
