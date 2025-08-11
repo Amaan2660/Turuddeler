@@ -190,7 +190,12 @@ def is_airport_place(text: str) -> bool:
         return True
     return any(k in s for k in AIRPORT_KW)
 
+def is_cph_area(text: str) -> bool:
+    s = _norm(text)
+    return any(k in s for k in CPH_KW)
+
 def is_copenhagen(a: str, b: str) -> bool:
+    # kept for compatibility
     s1, s2 = _norm(a), _norm(b)
     return any(k in s1 for k in CPH_KW) or any(k in s2 for k in CPH_KW)
 
@@ -240,7 +245,7 @@ def booking_type(row: pd.Series) -> str:
     pick_air = is_airport_place(pick)
     drop_air = is_airport_place(drop)
     if pick_air and drop_air:
-        return "A2C"   # normalize A->A into A2C per your ops
+        return "A2C"   # normalize A->A into A2C per ops
     if pick_air and not drop_air:
         return "A2C"
     if (not pick_air) and drop_air:
@@ -306,15 +311,19 @@ def row_is_cancelled(row: pd.Series) -> bool:
     return False
 
 def rule_gap_after(prev_row: pd.Series, next_row: pd.Series, gap_matrix: dict, cph_only: bool) -> timedelta:
-    """Extra gap based on prev_type ➜ next_type (C2C, A2C, C2A)."""
+    """
+    Extra gap based on prev_type ➜ next_type (C2C, A2C, C2A).
+    If cph_only=True, only apply when BOTH pickups are in the CPH area.
+    """
     if cph_only:
         prev_pick = get_pickup_text(prev_row)
         next_pick = get_pickup_text(next_row)
-        if not (is_copenhagen(prev_pick, prev_pick) and is_copenhagen(next_pick, next_pick)):
+        if not (is_cph_area(prev_pick) and is_cph_area(next_pick)):
             return timedelta(0)
+
     t_prev = booking_type(prev_row)
     t_next = booking_type(next_row)
-    mins = int(gap_matrix.get(t_prev, {}).get(t_next, 0))
+    mins = int((gap_matrix or DEFAULT_GAP_MATRIX).get(t_prev, {}).get(t_next, 0))
     return timedelta(minutes=mins)
 
 def extract_busy_until(note: str):
@@ -394,12 +403,14 @@ def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: tim
     return roster, windows
 
 def build_bilplan(plan_df: pd.DataFrame, service_date: date) -> str:
+    """Text export aggregating contiguous usage per (driver, car)."""
     if plan_df.empty:
         return f"BILPLAN {service_date.strftime('%d/%m/%y')}\n(No assignments)"
+
     rows = []
     for _, r in plan_df.iterrows():
         name = r.get("Allocated Driver","") or r.get("Assigned Driver","")
-        car = r.get("Allocated Car","") or r.get("Car","")
+        car  = r.get("Allocated Car","")   or r.get("Car","")
         if not name or not car:
             continue
         start = pd.to_datetime(r["Pickup Time"])
@@ -411,9 +422,14 @@ def build_bilplan(plan_df: pd.DataFrame, service_date: date) -> str:
         else:
             end = start + timedelta(hours=1)
         rows.append({"name": name, "car": car, "start": start, "end": end})
-    tmp = pd.DataFrame(rows)
+
+    if not rows:
+        return f"BILPLAN {service_date.strftime('%d/%m/%y')}\n(No assignments)"
+
+    tmp = pd.DataFrame(rows, columns=["name","car","start","end"])
     agg = tmp.groupby(["name","car"]).agg(start=("start","min"), end=("end","max")).reset_index()
     agg = agg.sort_values(["car","start"]).reset_index(drop=True)
+
     lines = [f"BILPLAN {service_date.strftime('%d/%m/%y')}"]
     for _, r in agg.iterrows():
         span = f"{r['start'].strftime('%H:%M')}-{r['end'].strftime('%H:%M')}"
@@ -507,22 +523,27 @@ def assign_plan_with_rostered_cars(
     cursor = 0
     in_active = set()
 
+    early_margin = timedelta(minutes=max(hard_early, soft_early))  # allow early activation
+    late_margin  = timedelta(minutes=late_allow)
+
     def refresh_active(now_dt: datetime):
         nonlocal active, cursor, in_active
-        # add who started
+        # add who is within early/late margins
         for nm in base_order:
             if nm in in_active:
                 continue
             st_dt = states[nm]["eff_start"]
             en_dt = states[nm]["eff_end"]
-            if st_dt <= now_dt < en_dt:
+            if (st_dt - early_margin) <= now_dt < (en_dt + late_margin):
                 active.append(nm)
                 in_active.add(nm)
-        # remove who ended
+        # remove who is outside window+late margin
         i = 0
         while i < len(active):
             nm = active[i]
-            if now_dt >= states[nm]["eff_end"]:
+            st_dt = states[nm]["eff_start"]
+            en_dt = states[nm]["eff_end"]
+            if not ((st_dt - early_margin) <= now_dt < (en_dt + late_margin)):
                 if i < cursor:
                     cursor -= 1
                 in_active.remove(nm)
@@ -744,7 +765,7 @@ with tab_setup:
 
     st.markdown("---")
 
-    # >>> Move "Drivers today" OUTSIDE the form so it updates immediately on change
+    # Drivers today (outside form so it reruns instantly)
     st.subheader("Drivers today")
     all_names = drivers_df["name"].tolist()
     if not st.session_state.selected_drivers:
@@ -777,7 +798,7 @@ with tab_setup:
             value=st.session_state.settings.get("respect_dates", True)
         )
 
-        # ---- Build presets (per-date first, then per-driver defaults), seed widget keys, then cascade
+        # Build presets (per-date first, then per-driver defaults), seed widget keys, then cascade
         selected = st.session_state.selected_drivers
         rows_preview = []
         cols = st.columns(2)
@@ -794,12 +815,10 @@ with tab_setup:
 
         # First pass: compute presets and seed widget keys
         for name in selected:
-            # prior per-date
             preset_start = prior.get(name, {}).get("start")
             preset_end   = prior.get(name, {}).get("end")
             preset_car   = prior.get(name, {}).get("preferred_car", "")
 
-            # per-driver defaults if no per-date
             if not isinstance(preset_start, datetime) or not isinstance(preset_end, datetime):
                 def_st, def_en, def_car = get_default_for_driver(name)
                 if (not isinstance(preset_start, datetime)) and def_st:
@@ -858,7 +877,6 @@ with tab_setup:
 
                 if start_b_time is None or _dt(start_b_time) < min_start_b_dt:
                     st.session_state[f"st_{b}"] = min_start_b_time
-                    # keep b's end >= start
                     end_b_time = st.session_state.get(f"et_{b}", None)
                     if end_b_time is not None and _dt(end_b_time) < min_start_b_dt:
                         st.session_state[f"et_{b}"] = (min_start_b_dt + timedelta(minutes=1)).time()
@@ -994,15 +1012,15 @@ with tab_plan:
                 driver_rows=driver_rows_live,
                 active_cars=active_cars,
                 service_date=svc_date,
-                car_handover=timedelta(minutes=settings["car_handover"]),
-                soft_early=settings["soft_early"],
-                hard_early=settings["hard_early"],
-                late_allow=settings["late_allow"],
-                auto_relax_to_soft=settings["auto_relax"],
+                car_handover=timedelta(minutes=settings.get("car_handover", 75)),
+                soft_early=settings.get("soft_early", 30),
+                hard_early=settings.get("hard_early", 60),
+                late_allow=settings.get("late_allow", 20),
+                auto_relax_to_soft=settings.get("auto_relax", True),
                 respect_dates=settings.get("respect_dates", True),
-                gap_matrix=settings["gap_matrix"],
-                gap_cph_only=settings["gap_cph_only"],
-                use_gap_only=settings["use_gap_only"],
+                gap_matrix=settings.get("gap_matrix", DEFAULT_GAP_MATRIX),
+                gap_cph_only=settings.get("gap_cph_only", False),
+                use_gap_only=settings.get("use_gap_only", True),
             )
         except Exception as e:
             st.error(f"Planning failed: {e}")
@@ -1073,8 +1091,13 @@ with tab_plan:
             roster_df = roster_df.sort_values(["Car","From"])
         st.dataframe(roster_df, use_container_width=True)
 
-        # BILPLAN export
-        bilplan_text = build_bilplan(plan_df, svc_date)
+        # BILPLAN export (guard if nothing assigned)
+        assigned_any = plan_df.get("Allocated Driver", "").astype(str).str.strip().ne("").any()
+        if not assigned_any:
+            bilplan_text = f"BILPLAN {svc_date.strftime('%d/%m/%y')}\n(No assignments)"
+        else:
+            bilplan_text = build_bilplan(plan_df, svc_date)
+
         st.subheader("BILPLAN")
         st.text_area("BILPLAN text", bilplan_text, height=320)
         st.download_button(
