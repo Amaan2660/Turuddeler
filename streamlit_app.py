@@ -152,7 +152,7 @@ DEFAULT_GAP_MATRIX = {
     "C2A": {"C2C": 50, "A2C": 0,  "C2A": 40},
 }
 
-# Column candidates (NOTE: prefer exact "Drop Off")
+# Column candidates (prefer exact "Drop Off")
 PICKUP_CANDIDATES  = [
     "Pickup","Pick Up","Pick up","Pickup Address","From","Start",
     "Start Address","PickupLocation","Pickup Loc","Pick Up Address"
@@ -759,64 +759,120 @@ with tab_setup:
             value=st.session_state.settings.get("respect_dates", True)
         )
 
-        # Driver multi-select and per-driver inputs
+        # Driver multi-select
         all_names = drivers_df["name"].tolist()
-
-        # Build a set of default selections: from session or just first N
         if st.session_state.driver_rows:
             default_names = [r["name"] for r in st.session_state.driver_rows]
         else:
             default_names = all_names[:min(len(all_names), 12)]
-
         selected = st.multiselect("Drivers today", options=all_names, default=default_names)
 
-        # Build UI rows with **live defaults per driver**
-        rows = []
+        # ---- Build presets (per-date first, then per-driver defaults), seed session_state, then cascade
+        rows_preview = []
         cols = st.columns(2)
-
-        # Quick dict for any previously loaded (date) shifts in session
         prior = {r["name"]: r for r in (st.session_state.driver_rows or [])}
+        service_day = st.session_state.service_date
 
+        # handover for cascade
+        handover_minutes = st.session_state.settings.get("car_handover", 75) if "settings" in st.session_state else 75
+        handover_td = timedelta(minutes=handover_minutes)
+
+        # helper: set widget default if missing
+        def _seed_key(key, value):
+            if key not in st.session_state:
+                st.session_state[key] = value
+
+        # First pass: compute presets and seed widget keys
+        for name in selected:
+            # prior per-date
+            preset_start = prior.get(name, {}).get("start")
+            preset_end   = prior.get(name, {}).get("end")
+            preset_car   = prior.get(name, {}).get("preferred_car", "")
+
+            # per-driver defaults if no per-date
+            if not isinstance(preset_start, datetime) or not isinstance(preset_end, datetime):
+                def_st, def_en, def_car = get_default_for_driver(name)
+                if (not isinstance(preset_start, datetime)) and def_st:
+                    try:
+                        hh, mm = map(int, def_st.split(":"))
+                        preset_start = datetime.combine(service_day, time(hh, mm))
+                    except:
+                        preset_start = None
+                if (not isinstance(preset_end, datetime)) and def_en:
+                    try:
+                        hh, mm = map(int, def_en.split(":"))
+                        preset_end = datetime.combine(service_day, time(hh, mm))
+                    except:
+                        preset_end = None
+                if not preset_car:
+                    preset_car = def_car or ""
+
+            start_val = preset_start.time() if isinstance(preset_start, datetime) else None
+            end_val   = preset_end.time() if isinstance(preset_end, datetime) else None
+            pref_val  = preset_car if preset_car in ([""] + active_cars) else ""
+
+            # seed the widget keys if not present yet
+            _seed_key(f"st_{name}", start_val)
+            _seed_key(f"et_{name}", end_val)
+            _seed_key(f"pref_{name}", pref_val)
+
+        # Live cascade toggle
+        cascade_live = st.checkbox(
+            "Auto-cascade next driver's start time (same car) to avoid overlaps",
+            value=True,
+            help="If two adjacent drivers have the same preferred car, the next driver's start is pushed to previous end + handover."
+        )
+
+        # Helper to combine date+time
+        def _dt(t: None | time):
+            if t is None:
+                return None
+            return datetime.combine(service_day, t)
+
+        # Apply cascade in list order (only pushes forward)
+        if cascade_live and len(selected) > 1:
+            for i in range(len(selected) - 1):
+                a = selected[i]
+                b = selected[i + 1]
+
+                pref_a = st.session_state.get(f"pref_{a}", "") or ""
+                pref_b = st.session_state.get(f"pref_{b}", "") or ""
+                if not pref_a or pref_a != pref_b:
+                    continue
+
+                end_a_time   = st.session_state.get(f"et_{a}", None)
+                start_b_time = st.session_state.get(f"st_{b}", None)
+                if end_a_time is None:
+                    continue
+
+                min_start_b_dt = _dt(end_a_time) + handover_td
+                min_start_b_time = min_start_b_dt.time()
+
+                if start_b_time is None or _dt(start_b_time) < min_start_b_dt:
+                    st.session_state[f"st_{b}"] = min_start_b_time
+                    # keep b's end >= start
+                    end_b_time = st.session_state.get(f"et_{b}", None)
+                    if end_b_time is not None and _dt(end_b_time) < min_start_b_dt:
+                        st.session_state[f"et_{b}"] = (min_start_b_dt + timedelta(minutes=1)).time()
+
+        # Now render inputs using session_state-backed values
+        rows = []
         for i, name in enumerate(selected):
             with cols[i % 2]:
                 st.markdown(f"**{name}**")
+                start_time = st.time_input(f"{name} start time",
+                                           value=st.session_state.get(f"st_{name}", None),
+                                           key=f"st_{name}")
+                end_time   = st.time_input(f"{name} end time",
+                                           value=st.session_state.get(f"et_{name}", None),
+                                           key=f"et_{name}")
+                pref       = st.selectbox(f"{name} preferred car",
+                                           [""] + active_cars,
+                                           index=([""] + active_cars).index(st.session_state.get(f"pref_{name}", "")) if st.session_state.get(f"pref_{name}", "") in ([""] + active_cars) else 0,
+                                           key=f"pref_{name}")
 
-                # 1) Start with any per-date shift in memory
-                preset_start = prior.get(name, {}).get("start")
-                preset_end   = prior.get(name, {}).get("end")
-                preset_car   = prior.get(name, {}).get("preferred_car", "")
-
-                # 2) If none, try per-driver defaults
-                if not preset_start or not isinstance(preset_start, datetime):
-                    def_st, def_en, def_car = get_default_for_driver(name)
-                    if def_st:
-                        try:
-                            hh, mm = map(int, def_st.split(":"))
-                            preset_start = datetime.combine(st.session_state.service_date, time(hh, mm))
-                        except:
-                            preset_start = None
-                    if def_en:
-                        try:
-                            hh, mm = map(int, def_en.split(":"))
-                            preset_end = datetime.combine(st.session_state.service_date, time(hh, mm))
-                        except:
-                            preset_end = None
-                    if not preset_car:
-                        preset_car = def_car or ""
-
-                # Convert to time values for widgets
-                start_val = preset_start.time() if isinstance(preset_start, datetime) else None
-                end_val   = preset_end.time() if isinstance(preset_end, datetime) else None
-                pref_val  = preset_car if preset_car in ([""] + active_cars) else ""
-
-                start_time = st.time_input(f"{name} start time", value=start_val, key=f"st_{name}")
-                end_time   = st.time_input(f"{name} end time",   value=end_val, key=f"et_{name}")
-                pref       = st.selectbox(f"{name} preferred car", [""] + active_cars, index=([""] + active_cars).index(pref_val) if pref_val in ([""] + active_cars) else 0, key=f"pref_{name}")
-
-                # Combine with service date (treat empty as full-day later)
-                start_dt = datetime.combine(st.session_state.service_date, start_time) if start_time else None
-                end_dt   = datetime.combine(st.session_state.service_date, end_time) if end_time else None
-
+                start_dt = datetime.combine(service_day, start_time) if start_time else None
+                end_dt   = datetime.combine(service_day, end_time) if end_time else None
                 rows.append({"name": name, "start": start_dt, "end": end_dt, "preferred_car": pref})
 
         driver_rows_live = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["name","start","end","preferred_car"])
@@ -846,24 +902,24 @@ with tab_setup:
         # Submit saves to session
         submitted = st.form_submit_button("Save driver setup (kept in session)")
         if submitted:
-            # Fill empties: if no times, assume full day
+            # Fill empties to full-day so they become active
             fixed_rows = []
             for r in rows:
                 st_dt = r["start"]
                 en_dt = r["end"]
                 if st_dt is None and en_dt is None:
-                    st_dt = datetime.combine(st.session_state.service_date, time(0,0))
-                    en_dt = datetime.combine(st.session_state.service_date, time(23,59))
+                    st_dt = datetime.combine(service_day, time(0,0))
+                    en_dt = datetime.combine(service_day, time(23,59))
                 elif st_dt is None and en_dt is not None:
-                    st_dt = datetime.combine(st.session_state.service_date, time(0,0))
+                    st_dt = datetime.combine(service_day, time(0,0))
                 elif st_dt is not None and en_dt is None:
-                    en_dt = datetime.combine(st.session_state.service_date, time(23,59))
+                    en_dt = datetime.combine(service_day, time(23,59))
                 fixed_rows.append({**r, "start": st_dt, "end": en_dt})
 
             st.session_state.active_cars = list(active_cars)
             st.session_state.driver_rows = fixed_rows
             st.session_state.settings = {
-                "service_date": st.session_state.service_date,
+                "service_date": service_day,
                 "respect_dates": bool(respect_dates),
                 "car_handover": int(hb_min),
                 "soft_early": int(soft_min),
@@ -876,7 +932,7 @@ with tab_setup:
             }
             st.success("Setup saved in session.")
 
-    # Save per-date shifts
+    # Save per-date shifts / per-driver defaults
     if st.session_state.driver_rows:
         colS1, colS2 = st.columns(2)
         with colS1:
