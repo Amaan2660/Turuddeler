@@ -389,7 +389,6 @@ def build_car_roster(driver_rows: pd.DataFrame, active_cars: list, handover: tim
         eff_end = req_end
         roster[name] = best_car
         windows[name] = (best_start, eff_end)
-        # advance this car's effective end to this driver's effective end
         car_effective_end[best_car] = eff_end
 
     return roster, windows
@@ -699,6 +698,8 @@ if "plan" not in st.session_state:
     st.session_state.plan = None
 if "service_date" not in st.session_state:
     st.session_state.service_date = datetime.now().date()
+if "selected_drivers" not in st.session_state:
+    st.session_state.selected_drivers = []
 
 drivers_df = load_drivers()
 if drivers_df.empty:
@@ -742,8 +743,25 @@ with tab_setup:
         st.caption("You can save after editing below.")
 
     st.markdown("---")
-    st.subheader("Drivers & Timing (saved only on submit)")
 
+    # >>> Move "Drivers today" OUTSIDE the form so it updates immediately on change
+    st.subheader("Drivers today")
+    all_names = drivers_df["name"].tolist()
+    if not st.session_state.selected_drivers:
+        if st.session_state.driver_rows:
+            st.session_state.selected_drivers = [r["name"] for r in st.session_state.driver_rows]
+        else:
+            st.session_state.selected_drivers = all_names[:min(len(all_names), 12)]
+
+    st.multiselect(
+        "Pick drivers for today",
+        options=all_names,
+        default=st.session_state.selected_drivers,
+        key="selected_drivers",
+        help="Changes here update the time editors below immediately."
+    )
+
+    st.subheader("Drivers & Timing (saved only on submit)")
     with st.form("driver_setup_form", clear_on_submit=False):
         # Active cars
         default_active = [c for c in CAR_POOL if c.lower() != "s-klasse"]
@@ -759,25 +777,17 @@ with tab_setup:
             value=st.session_state.settings.get("respect_dates", True)
         )
 
-        # Driver multi-select
-        all_names = drivers_df["name"].tolist()
-        if st.session_state.driver_rows:
-            default_names = [r["name"] for r in st.session_state.driver_rows]
-        else:
-            default_names = all_names[:min(len(all_names), 12)]
-        selected = st.multiselect("Drivers today", options=all_names, default=default_names)
-
-        # ---- Build presets (per-date first, then per-driver defaults), seed session_state, then cascade
+        # ---- Build presets (per-date first, then per-driver defaults), seed widget keys, then cascade
+        selected = st.session_state.selected_drivers
         rows_preview = []
         cols = st.columns(2)
         prior = {r["name"]: r for r in (st.session_state.driver_rows or [])}
         service_day = st.session_state.service_date
 
-        # handover for cascade
+        # handover for cascade (use saved settings if available)
         handover_minutes = st.session_state.settings.get("car_handover", 75) if "settings" in st.session_state else 75
         handover_td = timedelta(minutes=handover_minutes)
 
-        # helper: set widget default if missing
         def _seed_key(key, value):
             if key not in st.session_state:
                 st.session_state[key] = value
@@ -811,7 +821,6 @@ with tab_setup:
             end_val   = preset_end.time() if isinstance(preset_end, datetime) else None
             pref_val  = preset_car if preset_car in ([""] + active_cars) else ""
 
-            # seed the widget keys if not present yet
             _seed_key(f"st_{name}", start_val)
             _seed_key(f"et_{name}", end_val)
             _seed_key(f"pref_{name}", pref_val)
@@ -823,13 +832,12 @@ with tab_setup:
             help="If two adjacent drivers have the same preferred car, the next driver's start is pushed to previous end + handover."
         )
 
-        # Helper to combine date+time
         def _dt(t: None | time):
             if t is None:
                 return None
             return datetime.combine(service_day, t)
 
-        # Apply cascade in list order (only pushes forward)
+        # Apply cascade in list order (push forward only)
         if cascade_live and len(selected) > 1:
             for i in range(len(selected) - 1):
                 a = selected[i]
